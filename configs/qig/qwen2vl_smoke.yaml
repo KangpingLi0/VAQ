@@ -1,0 +1,17 @@
+# QIG smoke test defaults. Scripts pass these values through CLI arguments.
+model: qwen2_vl
+model_args: pretrained=/work/model/lkp/models/qwen2-vl
+calib_data: coco
+n_samples: 2
+data_path: /work/model/lkp/datasets/calib/calib.json
+image_folder: /work/model/lkp/datasets/images
+method: qig
+run_process: true
+pseudo_quant: true
+w_bit: 4
+a_bit: 16
+w_group: 128
+reweight: true
+distort: false
+loss_mode: mae
+scale_path: /work/model/lkp/experiments/qig/qwen2vl_smoke/scale/qig_w4a16.pt

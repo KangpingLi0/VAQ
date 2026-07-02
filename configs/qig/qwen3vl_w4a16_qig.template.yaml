@@ -1,0 +1,24 @@
+# Experimental template only. Qwen3-VL support requires a new adapter.
+model: qwen3_vl
+model_args: pretrained=/work/model/lkp/models/qwen3-vl
+calib_data: coco
+n_samples: 128
+data_path: /work/model/lkp/datasets/calib/calib.json
+image_folder: /work/model/lkp/datasets/images
+method: qig
+run_process: true
+w_bit: 4
+a_bit: 16
+w_group: 128
+reweight: true
+distort: false
+loss_mode: mae
+scale_path: /work/model/lkp/experiments/qig/qwen3vl_w4a16_qig/scale/qig_w4a16.pt
+todo:
+  - model class
+  - processor
+  - chat template
+  - image/video input format
+  - visual token index
+  - activation hook
+  - calibration forward

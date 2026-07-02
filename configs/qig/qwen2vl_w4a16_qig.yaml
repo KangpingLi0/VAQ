@@ -1,0 +1,18 @@
+# Qwen2-VL QIG W4A16 baseline defaults.
+model: qwen2_vl
+model_args: pretrained=/work/model/lkp/models/qwen2-vl
+calib_data: coco
+n_samples: 128
+data_path: /work/model/lkp/datasets/calib/calib.json
+image_folder: /work/model/lkp/datasets/images
+method: qig
+run_process: true
+pseudo_quant: true
+w_bit: 4
+a_bit: 16
+w_group: 128
+reweight: true
+distort: false
+loss_mode: mae
+scale_path: /work/model/lkp/experiments/qig/qwen2vl_w4a16_qig/scale/qig_w4a16.pt
+output_path: /work/model/lkp/experiments/qig/qwen2vl_w4a16_qig/eval
