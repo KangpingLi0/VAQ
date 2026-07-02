@@ -16,3 +16,4 @@ cache/
 __pycache__/
 *.pyc
 .DS_Store
+3rdparty/lmms-eval-new/

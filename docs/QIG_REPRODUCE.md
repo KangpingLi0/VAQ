@@ -168,6 +168,18 @@ bash scripts/qig/run_qwen25vl_w4a16_qig.sh
 
 The script defaults to `DRY_RUN=1`. Run with `DRY_RUN=0` only after the TODO items are validated.
 
+## New lmms-eval Reference For Qwen2.5-VL / Qwen3-VL
+
+The current QIG checkout originally did not include `3rdparty/lmms-eval`. A newer lmms-eval checkout has been cloned to:
+
+```text
+/work/model/lkp/QIG/3rdparty/lmms-eval-new
+```
+
+This directory is only a reference for later Qwen2.5-VL and Qwen3-VL downstream evaluation adaptation. It is not installed, and it does not replace the current QIG quantization or evaluation flow.
+
+For future integration, use it as a guide for Qwen2.5-VL / Qwen3-VL model adapters, processors, chat templates, and image/video input handling. When QIG support is added, migrate only the necessary logic into `qmllm/models/` or a separate evaluation entrypoint.
+
 ## Qwen3-VL Adaptation Plan
 
 The current official QIG code does not include a Qwen3-VL adapter. Do not modify Qwen2-VL behavior while adding Qwen3-VL support.
