@@ -57,6 +57,49 @@ class Qwen2_VL(BaseModel):
             self.model = self.model.to(self.device)
         return self
 
+    def _get_input_embedding_layer(self):
+        if hasattr(self.model, "get_input_embeddings"):
+            try:
+                emb = self.model.get_input_embeddings()
+                if emb is not None:
+                    self._last_embedding_source = "self.model.get_input_embeddings()"
+                    return emb
+            except Exception:
+                pass
+
+        candidates = [
+            ("self.model", self.model),
+            ("self.model.model", getattr(self.model, "model", None)),
+            ("self.model.language_model", getattr(self.model, "language_model", None)),
+            (
+                "self.model.model.language_model",
+                getattr(getattr(self.model, "model", None), "language_model", None),
+            ),
+        ]
+
+        for source, obj in candidates:
+            if obj is None:
+                continue
+
+            if hasattr(obj, "get_input_embeddings"):
+                try:
+                    emb = obj.get_input_embeddings()
+                    if emb is not None:
+                        self._last_embedding_source = f"{source}.get_input_embeddings()"
+                        return emb
+                except Exception:
+                    pass
+
+            if hasattr(obj, "embed_tokens"):
+                self._last_embedding_source = f"{source}.embed_tokens"
+                return obj.embed_tokens
+
+        raise AttributeError(
+            "Cannot locate input embedding layer for Qwen2-VL. "
+            f"outer={type(self.model)}, "
+            f"inner={type(getattr(self.model, 'model', None))}"
+        )
+
     def fetch_vit(self):
         return self.model.vision_model
 
@@ -397,7 +440,8 @@ class Qwen2_VL(BaseModel):
 
         # generate input embeddings
         # copied from the Qwen2VLForConditionalGeneration.forward
-        inputs_embeds = self.model.model.embed_tokens(input_ids) 
+        embed_layer = self._get_input_embedding_layer()
+        inputs_embeds = embed_layer(input_ids)
         pixel_values = pixel_values.type(self.model.visual.get_dtype())
         image_embeds = self.model.visual(pixel_values, grid_thw=image_grid_thw)
         image_mask = (input_ids == self.model.config.image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
