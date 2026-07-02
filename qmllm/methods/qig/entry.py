@@ -1,11 +1,12 @@
 import os
 import torch
 
+from utils.device import get_device
 from qmllm.methods.qig.quantize.pre_quant import run_qig, apply_qig
 from qmllm.methods.qig.quantize.quantizer import pseudo_quantize_model_weight, pseudo_quantize_model_weight_act
 
 
-def qig_entry(model, prompt_inputs, prompt_kwargs, run_qig_process: bool, pseudo_quant: bool, scale_path: str=None, zero_point: str=True, q_group_size: int=128, w_bit: int=4, a_bit: int=16, wa_quant: bool=False, reweight: bool=False, distort: bool=False, loss_mode: str="mae"):
+def qig_entry(model, prompt_inputs, prompt_kwargs, run_qig_process: bool, pseudo_quant: bool, scale_path: str=None, zero_point: str=True, q_group_size: int=128, w_bit: int=4, a_bit: int=16, wa_quant: bool=False, reweight: bool=False, distort: bool=False, loss_mode: str="mae", device=None):
     '''
     model: here the model is the LLM, you have to extract the LLM first! 
     prompt_tokens: the prompt tokens
@@ -18,6 +19,9 @@ def qig_entry(model, prompt_inputs, prompt_kwargs, run_qig_process: bool, pseudo
     }
 
     assert scale_path is not None
+    device = get_device(device or getattr(model, "device", "auto"))
+    if hasattr(model, "set_device"):
+        model.set_device(device)
 
     scale_exist = os.path.exists(scale_path)
     # reparameterization
@@ -35,6 +39,7 @@ def qig_entry(model, prompt_inputs, prompt_kwargs, run_qig_process: bool, pseudo
             wa_quant=wa_quant,
             reweight=reweight,
             distort=distort,
+            device=device,
         )
         
         dirpath = os.path.dirname(scale_path)
@@ -55,5 +60,8 @@ def qig_entry(model, prompt_inputs, prompt_kwargs, run_qig_process: bool, pseudo
             # weight activation quantization
             pseudo_quantize_model_weight_act(model.model, w_bit=w_bit, a_bit=a_bit)
 
-    model.to_cuda()
+    if hasattr(model, "to_device"):
+        model.to_device(device)
+    else:
+        model.to_cuda()
     return model

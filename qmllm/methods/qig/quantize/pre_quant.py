@@ -19,6 +19,7 @@ from qmllm.methods.qig.quantize.auto_scale_wa_distort import auto_scale_block_wa
 from qmllm.methods.qig.quantize.auto_scale import auto_scale_block, apply_scale
 from qmllm.quantization.qlinear import WALinear
 from qmllm.quantization.quant_funcs import pseudo_quantize_tensor
+from utils.device import empty_cache, get_device, move_to_device
 from .quantizer import get_module_by_name_suffix
 
 
@@ -213,18 +214,22 @@ def run_qig(
     loss_mode="mae",
     wa_quant=False,
     reweight=False,
-    distort=False
+    distort=False,
+    device=None,
 ):
+    device = get_device(device or getattr(model, "device", "auto"))
+    if hasattr(model, "set_device"):
+        model.set_device(device)
     if "bigcode" in str(model.model.__class__).lower():
         # otherwise attention_mask will always be on cpu.
-        model.transformer.bias = model.transformer.bias.to("cuda")
+        model.transformer.bias = model.transformer.bias.to(device)
 
     layers = get_blocks(model.model)
 
     inps = []
     layer_kwargs = {}
 
-    layers[0] = layers[0].cuda()
+    layers[0] = layers[0].to(device)
     move_embed(model.model, 'cpu')
 
     # get input and kwargs to layer 0
@@ -245,10 +250,11 @@ def run_qig(
     layers[0] = Catcher(layers[0])
 
     inputs, vision_mask, caption_mask = process_input(prompt_inputs, prompt_kwargs)
+    inputs = move_to_device(inputs, device)
 
     # model.to_cuda()
     try:
-        if torch.cuda.device_count() > 1:
+        if device.type == "cuda" and torch.cuda.device_count() > 1:
             model.to_cpu()
             for k, v in inputs.items():
                 if torch.is_tensor(v):
@@ -270,7 +276,7 @@ def run_qig(
     move_embed(model.model, "cpu")
 
     gc.collect()
-    torch.cuda.empty_cache()
+    empty_cache(device)
 
     qig_results = {
         "scale": [],
@@ -278,7 +284,10 @@ def run_qig(
 
     model.to_cpu()
     if reweight:
-        model.to_cuda()
+        if hasattr(model, "to_device"):
+            model.to_device(device)
+        else:
+            model.to_cuda()
         # save gradient
         grad_cache = GradCacheHook(vis_masks=vision_mask, cap_masks=caption_mask)        
         grad_cache.register_hooks(layers=layers)
@@ -325,13 +334,13 @@ def run_qig(
         inps_distort = copy.deepcopy(inps)
 
     gc.collect()
-    torch.cuda.empty_cache()
+    empty_cache(device)
 
     model.to_cpu()
     # solve layer by layer
     for i in tqdm.tqdm(range(len(layers)), desc="Running QIG..."):
         layer = layers[i]
-        layer = layer.cuda()
+        layer = layer.to(device)
         named_linears = get_named_linears(layer)
 
         # firstly, get input features of all linear layers
@@ -364,7 +373,7 @@ def run_qig(
         input_feat = {k: torch.cat(v, dim=0) for k, v in input_feat.items()}
 
         # Clear GPU memory
-        torch.cuda.empty_cache()
+        empty_cache(device)
 
         if reweight:
             scale_reweight_ratio_dict = {}
@@ -425,14 +434,14 @@ def run_qig(
                 # get distort output as next layer's input
                 if wa_quant:
                     layer_q = copy.deepcopy(layer)
-                    layer_q = layer_q.cuda()
+                    layer_q = layer_q.to(device)
                     named_linears_q = get_named_linears(layer_q)
                     for n, m in named_linears_q.items():
                         new_linear = WALinear.from_float(m, weight_quant="per_channel", act_quant="per_token", w_bit=w_bit, a_bit=a_bit)
                         father_module = get_module_by_name_suffix(layer_q, '.'.join(n.split(".")[:-1]))
                         setattr(father_module, n.split('.')[-1], new_linear)
                         del new_linear, m
-                        torch.cuda.empty_cache()
+                        empty_cache(device)
                     
                     inps_distort = inps_distort.to(next(layer_q.parameters()).device)  # in case multi-gpu
                     inps_distort = layer_q(inps_distort, **layer_kwargs)[0]
@@ -444,13 +453,13 @@ def run_qig(
             )
 
         # Clear GPU memory
-        torch.cuda.empty_cache()
+        empty_cache(device)
 
         layer = layer.cpu()
         # Haotian: check activation replacement
         del input_feat
         gc.collect()
-        torch.cuda.empty_cache()
+        empty_cache(device)
 
     return qig_results
 

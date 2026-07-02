@@ -12,6 +12,7 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm  # Used in app
 
 from qmllm.utils.search import get_op_by_name, get_op_name, set_op_by_name
 from qmllm.quantization.quant_funcs import pseudo_quantize_tensor
+from utils.device import empty_cache
 
 __all__ = ["auto_scale_block", "apply_scale"]
 
@@ -228,7 +229,7 @@ def auto_scale_block(
                 block_q.train()
 
             del block_q
-            torch.cuda.empty_cache()
+            empty_cache(device)
             return token_w.detach(), iqr_vis
 
         def _uniform_weights(x, ans_mask, vis_mask):
@@ -666,14 +667,15 @@ def auto_scale_block(
 # =========================
 @torch.no_grad()
 def apply_scale(module, scales_list, input_feat_dict=None):
+    target_device = next(module.parameters()).device
     for prev_op_name, layer_names, scales in scales_list:
         prev_op = get_op_by_name(module, prev_op_name)
         layers = [get_op_by_name(module, name) for name in layer_names]
 
-        prev_op.cuda()
+        prev_op.to(target_device)
         for layer in layers:
-            layer.cuda()
-        scales.cuda()
+            layer.to(target_device)
+        scales = scales.to(target_device)
 
         if isinstance(prev_op, nn.Linear):
             assert len(layers) == 1

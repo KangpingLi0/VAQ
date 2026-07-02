@@ -17,6 +17,7 @@ from typing import Union
 
 from lmms_eval.models import get_model
 
+from utils.device import get_device
 from qmllm.quantization.quant_wrapper import qwrapper
 from qmllm.models import get_process_model
 from qmllm.calibration.pileval import get_calib_dataset
@@ -52,8 +53,9 @@ def parse_quant_args() -> argparse.Namespace:
     parser.add_argument(
         "--device",
         type=str,
-        default=None,
-        help="Device to use (e.g. cuda, cuda:0, cpu)",
+        default="auto",
+        choices=["auto", "npu", "cuda", "cpu"],
+        help="Device to use.",
     )
     # calibration parameters
     parser.add_argument("--calib_data", default="pileval", choices=["pileval", "coco", "ocr_parquet", "mix_vl", None])
@@ -91,6 +93,25 @@ def parse_quant_args() -> argparse.Namespace:
     return args
 
 
+def _prepare_model_args_for_device(model_args: str, device) -> str:
+    if device.type != "npu":
+        return model_args
+
+    parts = [part for part in model_args.split(",") if part]
+    filtered = []
+    has_torch_dtype = False
+    for part in parts:
+        key = part.split("=", 1)[0].strip()
+        if key == "device_map":
+            continue
+        if key == "torch_dtype":
+            has_torch_dtype = True
+        filtered.append(part)
+    if not has_torch_dtype:
+        filtered.append("torch_dtype=float16")
+    return ",".join(filtered)
+
+
 def cli_quant(args: Union[argparse.Namespace, None] = None) -> None:
     if not args:
         args = parse_quant_args()
@@ -120,13 +141,16 @@ def cli_quant_single(args: Union[argparse.Namespace, None] = None) -> None:
     # here we load MLLMs outside of the evaluator.
     if args.model_args is None:
         args.model_args = ""
+    device = get_device(args.device)
+    args.torch_device = device
+    args.model_args = _prepare_model_args_for_device(args.model_args, device)
     
     ModelClass = get_model(args.model)
     lm = ModelClass.create_from_arg_string(
         args.model_args,
         {
             "batch_size": args.batch_size,
-            "device": args.device,
+            "device": str(device),
         },
     )
 
@@ -135,6 +159,8 @@ def cli_quant_single(args: Union[argparse.Namespace, None] = None) -> None:
     process_model = Process_ModelClass(lm._model, 
                                        lm._tokenizer,
                                        lm.processor if hasattr(lm, 'processor') else None)
+    if hasattr(process_model, "set_device"):
+        process_model.set_device(device)
 
     # Generate the calibration tokens.
     prompt_inputs = None

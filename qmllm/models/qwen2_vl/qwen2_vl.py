@@ -23,6 +23,7 @@ except ImportError:
 
 from PIL import Image, ImageFile, PngImagePlugin, UnidentifiedImageError
 
+from utils.device import get_device
 from qmllm.models.base import BaseModel
 from qmllm.utils.registry import MODEL_REGISTRY
 
@@ -40,6 +41,21 @@ class Qwen2_VL(BaseModel):
 
         self.num_params = sum(p.numel() for p in self.model.parameters())
         self.device_map = getattr(model, 'hf_device_map', {})
+        self.device = get_device("auto")
+
+    def set_device(self, device):
+        self.device = get_device(device)
+
+    def to_device(self, device=None):
+        if device is not None:
+            self.set_device(device)
+        if self.device.type == "cuda":
+            self.to_cuda()
+        elif self.device.type == "npu":
+            self.model = self.model.to(device=self.device, dtype=torch.float16)
+        else:
+            self.model = self.model.to(self.device)
+        return self
 
     def fetch_vit(self):
         return self.model.vision_model
@@ -144,12 +160,14 @@ class Qwen2_VL(BaseModel):
     
     def to_cuda(self):
         # if self.num_params > 20 * 10 ** 9: # 20B model
-        if torch.cuda.device_count() > 1:
+        if self.device.type == "cuda" and torch.cuda.device_count() > 1:
             device_map = self.split_model(self.model.model.config.num_hidden_layers)
             self.model = dispatch_model(self.model, device_map=device_map)
             self._hooks_checked = False
+        elif self.device.type == "cuda":
+            self.model = self.model.to(self.device)
         else:
-            self.model = self.model.cuda()
+            self.model = self.model.to(self.device)
 
     def to_cpu(self):
         if self.num_params > 20 * 10 ** 9: # 20B model
@@ -162,7 +180,7 @@ class Qwen2_VL(BaseModel):
             return
         self._hooks_checked = True
 
-        if torch.cuda.device_count() <= 1 or not getattr(self, "device_map", None):
+        if self.device.type != "cuda" or torch.cuda.device_count() <= 1 or not getattr(self, "device_map", None):
             return
 
         for _, m in self.model.named_modules():
@@ -369,12 +387,13 @@ class Qwen2_VL(BaseModel):
 
     @torch.no_grad()   
     def generate_input(self, data_samples):
-        input_ids = data_samples['input_ids'].cuda()
-        attention_mask = data_samples['attention_mask'].cuda()
-        labels = data_samples['labels'].cuda() 
-        pixel_values = data_samples['pixel_values'].to(self.model.dtype).cuda()
-        image_grid_thw = data_samples['image_grid_thw'].cuda()
-        self.to_cuda()
+        self.to_device(self.device)
+        device = next(self.model.parameters()).device
+        input_ids = data_samples['input_ids'].to(device)
+        attention_mask = data_samples['attention_mask'].to(device)
+        labels = data_samples['labels'].to(device)
+        pixel_values = data_samples['pixel_values'].to(device=device, dtype=self.model.dtype)
+        image_grid_thw = data_samples['image_grid_thw'].to(device)
 
         # generate input embeddings
         # copied from the Qwen2VLForConditionalGeneration.forward

@@ -31,6 +31,7 @@ from lmms_eval.utils import (
     simple_parse_args_string,
 )
 
+from utils.device import get_device
 from qmllm.quantization.quant_wrapper import qwrapper
 from qmllm.models import get_process_model
 from qmllm.calibration.pileval import get_calib_dataset
@@ -122,8 +123,9 @@ def parse_eval_args() -> argparse.Namespace:
     parser.add_argument(
         "--device",
         type=str,
-        default=None,
-        help="Device to use (e.g. cuda, cuda:0, cpu)",
+        default="auto",
+        choices=["auto", "npu", "cuda", "cpu"],
+        help="Device to use.",
     )
     parser.add_argument(
         "--output_path",
@@ -299,6 +301,25 @@ def parse_eval_args() -> argparse.Namespace:
     return args
 
 
+def _prepare_model_args_for_device(model_args: str, device) -> str:
+    if device.type != "npu":
+        return model_args
+
+    parts = [part for part in model_args.split(",") if part]
+    filtered = []
+    has_torch_dtype = False
+    for part in parts:
+        key = part.split("=", 1)[0].strip()
+        if key == "device_map":
+            continue
+        if key == "torch_dtype":
+            has_torch_dtype = True
+        filtered.append(part)
+    if not has_torch_dtype:
+        filtered.append("torch_dtype=float16")
+    return ",".join(filtered)
+
+
 def cli_evaluate(args: Union[argparse.Namespace, None] = None) -> None:
     if not args:
         args = parse_eval_args()
@@ -392,6 +413,9 @@ def cli_evaluate(args: Union[argparse.Namespace, None] = None) -> None:
 
 
 def cli_evaluate_single(args: Union[argparse.Namespace, None] = None) -> None:
+    device = get_device(args.device)
+    args.torch_device = device
+    args.model_args = _prepare_model_args_for_device(args.model_args or "", device)
     selected_task_list = args.tasks.split(",") if args.tasks else None
 
     if args.include_path is not None:
@@ -490,7 +514,7 @@ def cli_evaluate_single(args: Union[argparse.Namespace, None] = None) -> None:
         args.model_args,
         {
             "batch_size": args.batch_size,
-            "device": args.device,
+            "device": str(device),
         },
     )
     # 
@@ -500,6 +524,8 @@ def cli_evaluate_single(args: Union[argparse.Namespace, None] = None) -> None:
         process_model = Process_ModelClass(lm._model, 
                                         lm._tokenizer, 
                                         lm.processor if hasattr(lm, 'processor') else None)
+        if hasattr(process_model, "set_device"):
+            process_model.set_device(device)
 
 
         prompt_inputs = None
