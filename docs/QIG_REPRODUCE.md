@@ -176,9 +176,43 @@ The current QIG checkout originally did not include `3rdparty/lmms-eval`. A newe
 /work/model/lkp/QIG/3rdparty/lmms-eval-new
 ```
 
-This directory is only a reference for later Qwen2.5-VL and Qwen3-VL downstream evaluation adaptation. It is not installed, and it does not replace the current QIG quantization or evaluation flow.
+This directory is only a reference for later Qwen2.5-VL and Qwen3-VL downstream evaluation adaptation. It does not replace the current QIG quantization or evaluation flow, and it is not installed into the original `vtiq-py311` environment.
 
 For future integration, use it as a guide for Qwen2.5-VL / Qwen3-VL model adapters, processors, chat templates, and image/video input handling. When QIG support is added, migrate only the necessary logic into `qmllm/models/` or a separate evaluation entrypoint.
+
+## Unified QIG + Latest lmms-eval Environment
+
+The unified environment is:
+
+```text
+/work/data/lkp/miniconda3/envs/qig-lmms-py311
+```
+
+The original NPU environment remains unchanged:
+
+```text
+/work/data/lkp/miniconda3/envs/vtiq-py311
+```
+
+`qig-lmms-py311` was cloned from `vtiq-py311` to keep the working QIG NPU stack, including `torch`, `torch_npu`, the CANN-compatible packages, and existing QIG dependencies. The latest lmms-eval reference at `/work/model/lkp/QIG/3rdparty/lmms-eval-new` is installed into the new environment in editable mode.
+
+This environment is intended for:
+
+- Current QIG NPU quantization runs.
+- Later Qwen2.5-VL and Qwen3-VL downstream evaluation adaptation.
+
+Use it by setting:
+
+```bash
+export PYTHON_BIN=/work/data/lkp/miniconda3/envs/qig-lmms-py311/bin/python
+```
+
+pip freeze records are stored outside the repository-tracked files:
+
+```text
+/work/model/lkp/experiments/qig/qig_lmms_py311_freeze_before.txt
+/work/model/lkp/experiments/qig/qig_lmms_py311_freeze_after.txt
+```
 
 ## Qwen3-VL Adaptation Plan
 
