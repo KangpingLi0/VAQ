@@ -15,6 +15,7 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
 from .qmodule import ScaledActivation
 from .quantizer import get_module_by_name_suffix
 from qmllm.utils.search import get_op_by_name, get_op_name, set_op_by_name
+from qmllm.utils.device import empty_cache, module_device
 from qmllm.quantization.quant_funcs import pseudo_quantize_tensor
 from qmllm.quantization.qlinear import WALinear
 
@@ -135,7 +136,7 @@ def auto_scale_block_wa_distort(module, module_kwargs, w_bit, a_bit, q_config, i
                     setattr(block, fc_name, new_fc)
                     
                 del new_fc
-                torch.cuda.empty_cache()
+                empty_cache(block)
 
             x_scale = x_q / (scales.view(1, 1, -1)) 
 
@@ -153,8 +154,8 @@ def auto_scale_block_wa_distort(module, module_kwargs, w_bit, a_bit, q_config, i
 
             if loss_mode == "mse":
                 if ans_mask is not None and vis_mask is not None:
-                    ans_mask_expand = ans_mask.unsqueeze(-1).expand_as(out)
-                    vis_mask_expand = vis_mask.unsqueeze(-1).expand_as(out).cuda()
+                    ans_mask_expand = ans_mask.unsqueeze(-1).expand_as(out).to(out.device)
+                    vis_mask_expand = vis_mask.unsqueeze(-1).expand_as(out).to(out.device)
                     masked_diff_ans = ((org_out - out).float().pow(2) * ans_mask_expand)
                     masked_diff_vis = ((org_out - out).float().pow(2) * vis_mask_expand)
                     if reweight_ratio is not None:
@@ -164,7 +165,7 @@ def auto_scale_block_wa_distort(module, module_kwargs, w_bit, a_bit, q_config, i
                             (org_out - out).float().pow(2).mean().item()
                         ) 
                 elif ans_mask is not None and vis_mask is None:
-                    ans_mask_expand = ans_mask.unsqueeze(-1).expand_as(out)
+                    ans_mask_expand = ans_mask.unsqueeze(-1).expand_as(out).to(out.device)
                     masked_diff = ((org_out - out).float().pow(2) * ans_mask_expand)
                     loss = masked_diff.sum() / ans_mask_expand.sum() 
                 else:
@@ -173,8 +174,8 @@ def auto_scale_block_wa_distort(module, module_kwargs, w_bit, a_bit, q_config, i
                     )  # float prevents overflow
             elif loss_mode == "mae":
                 if ans_mask is not None and vis_mask is not None:
-                    ans_mask_expand = ans_mask.unsqueeze(-1).expand_as(out)
-                    vis_mask_expand = vis_mask.unsqueeze(-1).expand_as(out).cuda()
+                    ans_mask_expand = ans_mask.unsqueeze(-1).expand_as(out).to(out.device)
+                    vis_mask_expand = vis_mask.unsqueeze(-1).expand_as(out).to(out.device)
                     masked_diff_ans = ((org_out - out).float().abs() * ans_mask_expand)
                     masked_diff_vis = ((org_out - out).float().abs() * vis_mask_expand)
                     if reweight_ratio is not None:
@@ -184,7 +185,7 @@ def auto_scale_block_wa_distort(module, module_kwargs, w_bit, a_bit, q_config, i
                             (org_out - out).float().abs().mean().item()
                         ) 
                 elif ans_mask is not None and vis_mask is None:
-                    ans_mask_expand = ans_mask.unsqueeze(-1).expand_as(out)
+                    ans_mask_expand = ans_mask.unsqueeze(-1).expand_as(out).to(out.device)
                     masked_diff = ((org_out - out).float().abs() * ans_mask_expand)
                     loss = masked_diff.sum() / ans_mask_expand.sum() 
                 else:
@@ -208,7 +209,7 @@ def auto_scale_block_wa_distort(module, module_kwargs, w_bit, a_bit, q_config, i
             
             if isinstance(block, nn.Linear):
                 del new_block 
-            torch.cuda.empty_cache()
+            empty_cache(block)
             block.load_state_dict(org_sd)
         if best_ratio == -1:
             print(history)
@@ -247,13 +248,13 @@ def auto_scale_block_wa_distort(module, module_kwargs, w_bit, a_bit, q_config, i
 
         if scales_list is not None:
             apply_scale(new_module, scales_list)
-            new_module.cuda()
+            new_module.to(module_device(module))
             for n, m in named_linears.items():
                 new_linear = WALinear.from_float(m, weight_quant="per_channel", act_quant="per_token", w_bit=w_bit, a_bit=a_bit)
                 father_module = get_module_by_name_suffix(new_module, '.'.join(n.split(".")[:-1]))
                 setattr(father_module, n.split('.')[-1], new_linear)
                 del new_linear, m
-                torch.cuda.empty_cache()
+                empty_cache(new_module)
 
             named_linears = {name: m for name, m in new_module.named_modules() if isinstance(m, WALinear)}  
         
@@ -280,7 +281,7 @@ def auto_scale_block_wa_distort(module, module_kwargs, w_bit, a_bit, q_config, i
         input_feat_q = {k: torch.cat(v, dim=0) for k, v in input_feat_q.items()}
 
         del new_module
-        torch.cuda.empty_cache()
+        empty_cache(module)
 
         # module.load_state_dict(org_sd)
 
@@ -880,14 +881,15 @@ def auto_scale_block_wa_distort(module, module_kwargs, w_bit, a_bit, q_config, i
     return scales_list
 
 def apply_scale(module, scales_list, input_feat_dict=None):
+    device = module_device(module)
     for prev_op_name, layer_names, scales in scales_list:
         prev_op = get_op_by_name(module, prev_op_name)
         layers = [get_op_by_name(module, name) for name in layer_names]
 
-        prev_op.cuda()
+        prev_op.to(device)
         for layer in layers:
-            layer.cuda()
-        scales.cuda()
+            layer.to(device)
+        scales = scales.to(device)
 
         if isinstance(prev_op, nn.Linear):
             assert len(layers) == 1

@@ -5,6 +5,7 @@ import tqdm
 import torch
 import torch.nn as nn
 import logging
+from qmllm.utils.device import empty_cache, synchronize
 
 class GPTQ:
     def __init__(self, layer):
@@ -17,7 +18,7 @@ class GPTQ:
         self.nsamples = 0
 
     def add_batch(self, inp, out):
-        inp = inp.cuda()
+        inp = inp.to(self.dev)
         if len(inp.shape) == 2:
             inp = inp.unsqueeze(0)
         tmp = inp.shape[0]
@@ -113,7 +114,7 @@ class GPTQ:
 
             W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
 
-        torch.cuda.synchronize()
+        synchronize(self.dev)
 
         if actorder:
             Q = Q[:, invperm]
@@ -129,11 +130,11 @@ class GPTQ:
         self.H = None
         self.Losses = None
         self.Trace = None
-        torch.cuda.empty_cache()
-        cleanup_memory(verbos=False)
+        empty_cache(self.dev)
+        cleanup_memory(verbos=False, device=self.dev)
 
 
-def cleanup_memory(verbos=True) -> None:
+def cleanup_memory(verbos=True, device=None) -> None:
     """Run GC and clear GPU memory."""
     import gc
     import inspect
@@ -143,19 +144,24 @@ def cleanup_memory(verbos=True) -> None:
     except (ValueError, KeyError):
         pass
 
+    resolved = torch.device(device) if device is not None else None
+
     def total_reserved_mem() -> int:
-        return sum(torch.cuda.memory_reserved(device=i) for i in range(torch.cuda.device_count()))
+        if resolved is not None and resolved.type == "cuda" and torch.cuda.is_available():
+            return sum(torch.cuda.memory_reserved(device=i) for i in range(torch.cuda.device_count()))
+        if resolved is not None and resolved.type == "npu" and hasattr(torch, "npu") and hasattr(torch.npu, "memory_reserved"):
+            return sum(torch.npu.memory_reserved(device=i) for i in range(torch.npu.device_count()))
+        return 0
 
     memory_before = total_reserved_mem()
 
     # gc.collect and empty cache are necessary to clean up GPU memory if the model was distributed
     gc.collect()
 
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        memory_after = total_reserved_mem()
-        if verbos:
-            logging.info(
-                f"GPU memory{caller_name}: {memory_before / (1024 ** 3):.2f} -> {memory_after / (1024 ** 3):.2f} GB"
-                f" ({(memory_after - memory_before) / (1024 ** 3):.2f} GB)"
-            )
+    empty_cache(resolved)
+    memory_after = total_reserved_mem()
+    if verbos and resolved is not None and resolved.type in {"cuda", "npu"}:
+        logging.info(
+            f"{resolved.type.upper()} memory{caller_name}: {memory_before / (1024 ** 3):.2f} -> {memory_after / (1024 ** 3):.2f} GB"
+            f" ({(memory_after - memory_before) / (1024 ** 3):.2f} GB)"
+        )

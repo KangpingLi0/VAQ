@@ -24,7 +24,7 @@ def gptq_entry(model,
                model_type: str=None
 ):
     if pseudo_quant:
-        if torch.cuda.device_count() > 1:
+        if torch.cuda.is_available() and torch.cuda.device_count() > 1:
             model.to_cpu()
             # accelerator = Accelerator()
             # model = accelerator.unwrap_model(model.model)
@@ -60,4 +60,3 @@ def gptq_entry(model,
     
 
     return model
-

@@ -5,6 +5,7 @@ from tqdm import tqdm
 from transformers.models.bloom.modeling_bloom import BloomForCausalLM
 from transformers.models.opt.modeling_opt import OPTForCausalLM
 from transformers.models.llama.modeling_llama import LlamaForCausalLM
+from qmllm.utils.device import empty_cache
 
 def quantize_opt(
     model, weight_quant="per_tensor", act_quant="per_tensor", w_bit=4, a_bit=8, quantize_bmm_input=True
@@ -293,4 +294,4 @@ def pseudo_quantize_model_weight_act(
             father_module = get_module_by_name_suffix(layers[i], '.'.join(n.split(".")[:-1]))
             setattr(father_module, n.split('.')[-1], new_linear)
             del new_linear, m
-            torch.cuda.empty_cache()
+            empty_cache(layers[i])

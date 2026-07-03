@@ -4,6 +4,7 @@ import torch.nn as nn
 
 import functools
 from tqdm import tqdm
+from qmllm.utils.device import empty_cache
 
 
 def process_input(prompt_inputs, prompt_kwargs):
@@ -70,7 +71,7 @@ def get_act_scales(model, prompt_inputs, prompt_kwargs):
             
         outputs = model(**mini_inputs)
         del mini_inputs
-        torch.cuda.empty_cache()
+        empty_cache(device)
 
     for h in hooks:
         h.remove()

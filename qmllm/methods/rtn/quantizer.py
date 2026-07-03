@@ -5,6 +5,7 @@ from qmllm.quantization.quant_funcs import pseudo_quantize_tensor
 from qmllm.quantization.qlinear import WALinear
 from transformers.models.bloom.modeling_bloom import BloomForCausalLM
 from transformers.models.opt.modeling_opt import OPTForCausalLM
+from qmllm.utils.device import empty_cache
 
 def get_named_linears(module):
     return {name: m for name, m in module.named_modules() if isinstance(m, nn.Linear)}
@@ -82,4 +83,4 @@ def pseudo_quantize_model_weight_act(
             father_module = get_module_by_name_suffix(layers[i], '.'.join(n.split(".")[:-1]))
             setattr(father_module, n.split('.')[-1], new_linear)
             del new_linear, m
-            torch.cuda.empty_cache()
+            empty_cache(layers[i])

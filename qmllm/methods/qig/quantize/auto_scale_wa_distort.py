@@ -17,10 +17,22 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
 from .qmodule import ScaledActivation
 from .quantizer import get_module_by_name_suffix
 from qmllm.utils.search import get_op_by_name, get_op_name, set_op_by_name
+from qmllm.utils.device import empty_cache as _empty_cache
 from qmllm.quantization.quant_funcs import pseudo_quantize_tensor
 from qmllm.quantization.qlinear import WALinear
 
 __all__ = ["auto_scale_block_wa_distort"]
+
+
+def _module_device(module):
+    try:
+        return next(module.parameters()).device
+    except StopIteration:
+        return torch.device("cpu")
+
+
+def _empty_device_cache(device):
+    _empty_cache(device)
 
 
 @torch.no_grad()
@@ -299,7 +311,7 @@ def auto_scale_block_wa_distort(
 
         # block_q is no longer needed after token weights are computed
         del block_q
-        torch.cuda.empty_cache()
+        _empty_device_cache(_module_device(block))
 
         x_max = get_act_scale(x_q)
 
@@ -338,7 +350,7 @@ def auto_scale_block_wa_distort(
                     setattr(block, fc_name, new_fc)
 
                 del new_fc
-                torch.cuda.empty_cache()
+                _empty_device_cache(_module_device(block))
 
             # Input scaling (distort-style)
             x_scale = x_q / (scales.view(1, 1, -1))
@@ -377,7 +389,7 @@ def auto_scale_block_wa_distort(
             if isinstance(block, nn.Linear):
                 del new_block
 
-            torch.cuda.empty_cache()
+            _empty_device_cache(_module_device(block))
             block.load_state_dict(org_sd)
 
         if best_ratio == -1:
@@ -440,7 +452,7 @@ def auto_scale_block_wa_distort(
 
         if scales_list is not None:
             apply_scale(new_module, scales_list)
-            new_module.cuda()
+            new_module.to(_module_device(module))
 
             for n, m in named_linears.items():
                 new_linear = WALinear.from_float(
@@ -453,7 +465,7 @@ def auto_scale_block_wa_distort(
                 father_module = get_module_by_name_suffix(new_module, ".".join(n.split(".")[:-1]))
                 setattr(father_module, n.split(".")[-1], new_linear)
                 del new_linear, m
-                torch.cuda.empty_cache()
+                _empty_device_cache(_module_device(new_module))
 
             named_linears = {
                 name: m for name, m in new_module.named_modules() if isinstance(m, WALinear)
@@ -481,7 +493,7 @@ def auto_scale_block_wa_distort(
         input_feat_q = {k: torch.cat(v, dim=0) for k, v in input_feat_q.items()}
 
         del new_module
-        torch.cuda.empty_cache()
+        _empty_device_cache(_module_device(module))
         return input_feat_q
 
     # ===================== Architecture branches =====================
@@ -871,11 +883,12 @@ def apply_scale(module, scales_list, input_feat_dict=None):
     for prev_op_name, layer_names, scales in scales_list:
         prev_op = get_op_by_name(module, prev_op_name)
         layers = [get_op_by_name(module, name) for name in layer_names]
+        device = _module_device(module)
 
-        prev_op.cuda()
+        prev_op.to(device)
         for layer in layers:
-            layer.cuda()
-        scales.cuda()
+            layer.to(device)
+        scales = scales.to(device)
 
         if isinstance(prev_op, nn.Linear):
             assert len(layers) == 1

@@ -13,6 +13,7 @@ from transformers.models.llama.modeling_llama import LlamaForCausalLM
 from qmllm.calibration.pileval import get_calib_dataset
 from qmllm.calibration.coco_vl import get_multimodal_calib_dataset
 from qmllm.utils.search import append_str_prefix, get_op_name
+from qmllm.utils.device import empty_cache, module_device
 
 from qmllm.methods.awq.quantize.auto_scale import auto_scale_block, apply_scale
 
@@ -123,18 +124,19 @@ def run_awq(
     q_config,
     auto_scale=True,
 ):
+    device = torch.device(getattr(model, "device", module_device(model.model)))
 
     if "bigcode" in str(model.model.__class__).lower():
         # otherwise attention_mask will always be on cpu.
-        model.transformer.bias = model.transformer.bias.to("cuda")
+        model.transformer.bias = model.transformer.bias.to(device)
 
     layers = get_blocks(model.model)
 
     inps = []
     layer_kwargs = {}
 
-    layers[0] = layers[0].cuda()
-    move_embed(model.model, "cuda")
+    layers[0] = layers[0].to(device)
+    move_embed(model.model, device)
 
     # get input and kwargs to layer 0
     # with_kwargs is only supported in PyTorch 2.0
@@ -168,7 +170,7 @@ def run_awq(
     move_embed(model.model, "cpu")
 
     gc.collect()
-    torch.cuda.empty_cache()
+    empty_cache(device)
 
     awq_results = {
         "scale": [],
@@ -177,7 +179,7 @@ def run_awq(
     # solve layer by layer
     for i in tqdm.tqdm(range(len(layers)), desc="Running AWQ..."):
         layer = layers[i]
-        layer = layer.cuda()
+        layer = layer.to(device)
         named_linears = get_named_linears(layer)
 
         # firstly, get input features of all linear layers
@@ -203,7 +205,7 @@ def run_awq(
         input_feat = {k: torch.cat(v, dim=0) for k, v in input_feat.items()}
 
         # Clear GPU memory
-        torch.cuda.empty_cache()
+        empty_cache(device)
 
         if (
             auto_scale
@@ -224,13 +226,13 @@ def run_awq(
             )
 
         # Clear GPU memory
-        torch.cuda.empty_cache()
+        empty_cache(device)
 
         layer = layer.cpu()
         # Haotian: check activation replacement
         del input_feat
         gc.collect()
-        torch.cuda.empty_cache()
+        empty_cache(device)
 
     return awq_results
 

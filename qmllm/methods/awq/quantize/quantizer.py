@@ -4,6 +4,7 @@ from tqdm import tqdm
 import gc
 from qmllm.methods.awq.quantize.qmodule import ScaledActivation
 from qmllm.utils.search import set_op_by_name
+from qmllm.utils.device import module_device
 
 from transformers.models.bloom.modeling_bloom import BloomBlock
 from qmllm.quantization.quant_funcs import pseudo_quantize_tensor
@@ -67,9 +68,10 @@ def pseudo_quantize_model_weight(
 
     layers = get_blocks(model)
     for i in tqdm(range(len(layers)), desc="pseudo weight quantization..."):
+        device = module_device(layers[i])
         named_linears = get_named_linears(layers[i])
         for n, m in named_linears.items():
-            m.cuda()
+            m.to(device)
             m.weight.data = pseudo_quantize_tensor(
                 m.weight.data, n_bits=w_bit, **q_config
             )

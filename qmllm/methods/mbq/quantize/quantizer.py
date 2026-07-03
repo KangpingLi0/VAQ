@@ -8,6 +8,7 @@ from qmllm.utils.search import set_op_by_name
 from transformers.models.bloom.modeling_bloom import BloomBlock
 from qmllm.quantization.quant_funcs import pseudo_quantize_tensor
 from qmllm.quantization.qlinear import WALinear
+from qmllm.utils.device import empty_cache
 
 EMBEDDING_KEYWORDS = ["embed"]
 LM_HEAD_KEYWORDS = ["lm_head", "embed_out", "output"]
@@ -99,4 +100,4 @@ def pseudo_quantize_model_weight_act(
             father_module = get_module_by_name_suffix(layers[i], '.'.join(n.split(".")[:-1]))
             setattr(father_module, n.split('.')[-1], new_linear)
             del new_linear, m
-            torch.cuda.empty_cache()
+            empty_cache(layers[i])

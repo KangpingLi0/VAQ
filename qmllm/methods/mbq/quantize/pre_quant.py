@@ -14,6 +14,7 @@ from transformers.models.opt.modeling_opt import OPTForCausalLM
 from transformers.models.llama.modeling_llama import LlamaForCausalLM
 
 from qmllm.utils.search import append_str_prefix, get_op_name
+from qmllm.utils.device import empty_cache, module_device
 
 from qmllm.methods.mbq.quantize.auto_scale_wa_distort import auto_scale_block_wa_distort
 from qmllm.methods.mbq.quantize.auto_scale_wa import auto_scale_block_wa
@@ -302,17 +303,19 @@ def run_mbq(
     reweight=False,
     distort=False
 ):
+    device = torch.device(getattr(model, "device", module_device(model.model)))
+
     if "bigcode" in str(model.model.__class__).lower():
         # otherwise attention_mask will always be on cpu.
-        model.transformer.bias = model.transformer.bias.to("cuda")
+        model.transformer.bias = model.transformer.bias.to(device)
 
     layers = get_blocks(model.model)
 
     inps = []
     layer_kwargs = {}
 
-    layers[0] = layers[0].cuda()
-    move_embed(model.model, "cuda")
+    layers[0] = layers[0].to(device)
+    move_embed(model.model, device)
 
     # get input and kwargs to layer 0
     # with_kwargs is only supported in PyTorch 2.0
@@ -347,7 +350,7 @@ def run_mbq(
     move_embed(model.model, "cpu")
 
     gc.collect()
-    torch.cuda.empty_cache()
+    empty_cache(device)
 
     mbq_results = {
         "scale": [],
@@ -423,12 +426,12 @@ def run_mbq(
         inps_distort = copy.deepcopy(inps)
 
     gc.collect()
-    torch.cuda.empty_cache()
+    empty_cache(device)
 
     # solve layer by layer
     for i in tqdm.tqdm(range(len(layers)), desc="Running MBQ..."):
         layer = layers[i]
-        layer = layer.cuda()
+        layer = layer.to(device)
         named_linears = get_named_linears(layer)
 
         # firstly, get input features of all linear layers
@@ -459,7 +462,7 @@ def run_mbq(
         input_feat = {k: torch.cat(v, dim=0) for k, v in input_feat.items()}
 
         # Clear GPU memory
-        torch.cuda.empty_cache()
+        empty_cache(device)
 
         if reweight:
             scale_reweight_ratio_dict = {}
@@ -548,25 +551,25 @@ def run_mbq(
                 # get distort output as next layer's input
                 if wa_quant:
                     layer_q = copy.deepcopy(layer)
-                    layer_q = layer_q.cuda()
+                    layer_q = layer_q.to(device)
                     named_linears_q = get_named_linears(layer_q)
                     for n, m in named_linears_q.items():
                         new_linear = WALinear.from_float(m, weight_quant="per_channel", act_quant="per_token", w_bit=w_bit, a_bit=a_bit)
                         father_module = get_module_by_name_suffix(layer_q, '.'.join(n.split(".")[:-1]))
                         setattr(father_module, n.split('.')[-1], new_linear)
                         del new_linear, m
-                        torch.cuda.empty_cache()
+                        empty_cache(device)
                     
                     inps_distort = inps_distort.to(next(layer_q.parameters()).device)  # in case multi-gpu
                     inps_distort = layer_q(inps_distort, **layer_kwargs)[0]
                     del layer_q 
                 else:
                     layer_q = copy.deepcopy(layer)
-                    layer_q = layer_q.cuda()
+                    layer_q = layer_q.to(device)
                     named_linears_q = get_named_linears(layer_q)
                     for n, m in named_linears_q.items():
                         m.weight.data = pseudo_quantize_tensor(m.weight.data, n_bits=w_bit, **q_config)
-                        torch.cuda.empty_cache()
+                        empty_cache(device)
                     
                     inps_distort = inps_distort.to(next(layer_q.parameters()).device)  # in case multi-gpu
                     inps_distort = layer_q(inps_distort, **layer_kwargs)[0]
@@ -578,13 +581,13 @@ def run_mbq(
             )
 
         # Clear GPU memory
-        torch.cuda.empty_cache()
+        empty_cache(device)
 
         layer = layer.cpu()
         # Haotian: check activation replacement
         del input_feat
         gc.collect()
-        torch.cuda.empty_cache()
+        empty_cache(device)
 
     return mbq_results
 

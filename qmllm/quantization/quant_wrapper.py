@@ -6,6 +6,7 @@ from qmllm.methods.mbq.entry import mbq_entry
 from qmllm.methods.qig.entry import qig_entry
 from qmllm.methods.rtn.entry import rtn_entry
 from qmllm.methods.gptq.entry import gptq_entry
+from qmllm.utils.device import accelerator_device_count
 
 def qwrapper(model, prompt_inputs, prompt_kwargs, args):
     if args.method == "awq":
@@ -43,8 +44,7 @@ def qwrapper(model, prompt_inputs, prompt_kwargs, args):
         wa_quant = args.w_bit < 16 and args.a_bit < 16
         model = rtn_entry(model, pseudo_quant=args.pseudo_quant, wa_quant=wa_quant, q_group_size=args.w_group, w_bit=args.w_bit, a_bit=args.a_bit)
     elif args.method == "gptq":
-        import torch
-        if torch.cuda.device_count() > 1:
+        if accelerator_device_count(getattr(args, "torch_device", None)) > 1:
             model = gptq_entry(
                 model,
                 prompt_inputs,

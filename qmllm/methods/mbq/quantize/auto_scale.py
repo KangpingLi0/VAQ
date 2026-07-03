@@ -11,6 +11,7 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
 
 from .qmodule import ScaledActivation
 from qmllm.utils.search import get_op_by_name, get_op_name, set_op_by_name
+from qmllm.utils.device import module_device
 from qmllm.quantization.quant_funcs import pseudo_quantize_tensor
 
 __all__ = ["auto_scale_block", "apply_scale"]
@@ -143,8 +144,8 @@ def auto_scale_block(module, module_kwargs, w_bit, q_config, input_feat, ans_mas
 
             if loss_mode == "mse":
                 if ans_mask is not None and vis_mask is not None:
-                    ans_mask_expand = ans_mask.unsqueeze(-1).expand_as(out)
-                    vis_mask_expand = vis_mask.unsqueeze(-1).expand_as(out).cuda()
+                    ans_mask_expand = ans_mask.unsqueeze(-1).expand_as(out).to(out.device)
+                    vis_mask_expand = vis_mask.unsqueeze(-1).expand_as(out).to(out.device)
                     masked_diff_ans = ((org_out - out).float().pow(2) * ans_mask_expand)
                     masked_diff_vis = ((org_out - out).float().pow(2) * vis_mask_expand)
                     if reweight_ratio is not None:
@@ -154,7 +155,7 @@ def auto_scale_block(module, module_kwargs, w_bit, q_config, input_feat, ans_mas
                             (org_out - out).float().pow(2).mean().item()
                         ) 
                 elif ans_mask is not None and vis_mask is None:
-                    ans_mask_expand = ans_mask.unsqueeze(-1).expand_as(out)
+                    ans_mask_expand = ans_mask.unsqueeze(-1).expand_as(out).to(out.device)
                     masked_diff = ((org_out - out).float().pow(2) * ans_mask_expand)
                     loss = masked_diff.sum() / ans_mask_expand.sum() 
                 else:
@@ -163,8 +164,8 @@ def auto_scale_block(module, module_kwargs, w_bit, q_config, input_feat, ans_mas
                     )  # float prevents overflow
             elif loss_mode == "mae":
                 if ans_mask is not None and vis_mask is not None:
-                    ans_mask_expand = ans_mask.unsqueeze(-1).expand_as(out)
-                    vis_mask_expand = vis_mask.unsqueeze(-1).expand_as(out).cuda()
+                    ans_mask_expand = ans_mask.unsqueeze(-1).expand_as(out).to(out.device)
+                    vis_mask_expand = vis_mask.unsqueeze(-1).expand_as(out).to(out.device)
                     masked_diff_ans = ((org_out - out).float().abs() * ans_mask_expand)
                     masked_diff_vis = ((org_out - out).float().abs() * vis_mask_expand)
                     if reweight_ratio is not None:
@@ -174,7 +175,7 @@ def auto_scale_block(module, module_kwargs, w_bit, q_config, input_feat, ans_mas
                             (org_out - out).float().abs().mean().item()
                         ) 
                 elif ans_mask is not None and vis_mask is None:
-                    ans_mask_expand = ans_mask.unsqueeze(-1).expand_as(out)
+                    ans_mask_expand = ans_mask.unsqueeze(-1).expand_as(out).to(out.device)
                     masked_diff = ((org_out - out).float().abs() * ans_mask_expand)
                     loss = masked_diff.sum() / ans_mask_expand.sum() 
                 else:
@@ -631,14 +632,15 @@ def auto_scale_block(module, module_kwargs, w_bit, q_config, input_feat, ans_mas
 
 
 def apply_scale(module, scales_list, input_feat_dict=None):
+    device = module_device(module)
     for prev_op_name, layer_names, scales in scales_list:
         prev_op = get_op_by_name(module, prev_op_name)
         layers = [get_op_by_name(module, name) for name in layer_names]
 
-        prev_op.cuda()
+        prev_op.to(device)
         for layer in layers:
-            layer.cuda()
-        scales.cuda()
+            layer.to(device)
+        scales = scales.to(device)
 
         if isinstance(prev_op, nn.Linear):
             assert len(layers) == 1

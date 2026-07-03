@@ -17,11 +17,21 @@ from transformers.models.llama.modeling_llama import LlamaForCausalLM
 
 from qmllm.methods.gptq.quantize.qmodule import find_qlayers, WeightQuantizer
 from qmllm.methods.gptq.quantize.quantizer import GPTQ, cleanup_memory
+from qmllm.utils.device import empty_cache
 
 __all__ = ["run_gptq"]
-DEV = torch.device('cuda:0') if torch.cuda.is_available() else torch.device('cpu')
 
-NUM_GPU = torch.cuda.device_count()
+
+def _default_device():
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        return torch.device("npu:0")
+    if torch.cuda.is_available():
+        return torch.device("cuda:0")
+    return torch.device("cpu")
+
+
+DEV = _default_device()
+NUM_GPU = torch.cuda.device_count() if DEV.type == "cuda" and torch.cuda.is_available() else 0
 
 def get_named_linears(module):
     return {name: m for name, m in module.named_modules() if isinstance(m, nn.Linear)}
@@ -155,7 +165,9 @@ def run_gptq(model,
 
     move_embed(model.model, 'cpu')
     
-    layers[0] = layers[0].to('cuda')
+    device = torch.device(getattr(model, "device", DEV))
+
+    layers[0] = layers[0].to(device)
 
     dtype = next(iter(model.model.parameters())).dtype
 
@@ -190,7 +202,7 @@ def run_gptq(model,
     layer_kwargs["use_cache"] = False
     layers[0] = layers[0].cpu()
     move_embed(model.model, 'cpu')
-    torch.cuda.empty_cache()
+    empty_cache(device)
 
     outs = deepcopy(inps)
     
@@ -199,7 +211,7 @@ def run_gptq(model,
 
     for i in tqdm.tqdm(range(len(layers)), desc="(GPTQ Quant.) Layers"):
         # model.model.language_model.rotary_emb = model.model.language_model.rotary_emb.to('cuda')
-        layer = layers[i].to("cuda")
+        layer = layers[i].to(device)
         named_linears = get_named_linears(layer)
         for name in named_linears:
             gptq = {}
@@ -239,12 +251,12 @@ def run_gptq(model,
         layers[i] = layer.cpu()
         del layer
         del gptq
-        torch.cuda.empty_cache()
+        empty_cache(device)
 
         inps, outs = outs, inps
 
     # model.config.use_cache = use_cache
-    cleanup_memory(verbos=True)
+    cleanup_memory(verbos=True, device=device)
     logging.info('-----GPTQ Quantization Done-----')
     
 
