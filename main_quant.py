@@ -9,6 +9,7 @@ import warnings
 from functools import partial
 
 import numpy as np
+import torch
 import yaml
 
 warnings.simplefilter("ignore", category=DeprecationWarning)
@@ -62,6 +63,32 @@ def parse_quant_args() -> argparse.Namespace:
     parser.add_argument("--n_samples", default=128, type=int)
     parser.add_argument("--data_path", default="", type=str)
     parser.add_argument("--image_folder", default="", type=str)
+    parser.add_argument("--calib_image_size", default=0, type=int)
+    parser.add_argument(
+        "--calib_max_images",
+        default=0,
+        type=int,
+        help="Limit images per multimodal calibration sample. 0 keeps all images.",
+    )
+    parser.add_argument(
+        "--calib_image_chunk_size",
+        default=0,
+        type=int,
+        help=(
+            "Split each multimodal calibration sample into chunks of N images. "
+            "0 keeps the original sample intact. This preserves all images while "
+            "reducing per-forward sequence length for long multi-image samples."
+        ),
+    )
+    parser.add_argument("--calib_prompt", default="", type=str)
+    parser.add_argument("--calib_cache_path", default="", type=str)
+    parser.add_argument("--calib_cache_only", action="store_true")
+    parser.add_argument(
+        "--calib_cache_n_samples",
+        default=0,
+        type=int,
+        help="Use only the first N cached calibration samples. 0 keeps all samples.",
+    )
     parser.add_argument("--interleave_format", action="store_true")
     parser.add_argument("--few_shot_format", action="store_true")
     parser.add_argument("--text_data_path", default="", type=str)
@@ -88,6 +115,7 @@ def parse_quant_args() -> argparse.Namespace:
     parser.add_argument("--scale_path", default=None, type=str)
     parser.add_argument("--run_process", action="store_true")
     parser.add_argument("--pseudo_quant", action="store_true")
+    parser.add_argument("--percdamp", default=0.01, type=float)
     
     args = parser.parse_args()
     return args
@@ -110,6 +138,22 @@ def _prepare_model_args_for_device(model_args: str, device) -> str:
     if not has_torch_dtype:
         filtered.append("torch_dtype=float16")
     return ",".join(filtered)
+
+
+def _slice_cached_calib(obj, n_samples: int):
+    if n_samples <= 0:
+        return obj
+    if torch.is_tensor(obj):
+        if obj.dim() > 0 and obj.shape[0] >= n_samples:
+            return obj[:n_samples].clone().contiguous()
+        return obj
+    if isinstance(obj, dict):
+        return {key: _slice_cached_calib(value, n_samples) for key, value in obj.items()}
+    if isinstance(obj, list):
+        return [_slice_cached_calib(value, n_samples) for value in obj]
+    if isinstance(obj, tuple):
+        return tuple(_slice_cached_calib(value, n_samples) for value in obj)
+    return obj
 
 
 def cli_quant(args: Union[argparse.Namespace, None] = None) -> None:
@@ -166,7 +210,16 @@ def cli_quant_single(args: Union[argparse.Namespace, None] = None) -> None:
     prompt_inputs = None
     prompt_kwargs = None
 
-    if args.calib_data == "pileval":
+    if args.calib_cache_path and os.path.exists(args.calib_cache_path):
+        print(f"[calib-cache] Loading calibration inputs from {args.calib_cache_path}", flush=True)
+        calib_cache = torch.load(args.calib_cache_path, map_location="cpu")
+        prompt_inputs = calib_cache["prompt_inputs"]
+        prompt_kwargs = calib_cache["prompt_kwargs"]
+        if args.calib_cache_n_samples > 0:
+            print(f"[calib-cache] Using first {args.calib_cache_n_samples} cached samples", flush=True)
+            prompt_inputs = _slice_cached_calib(prompt_inputs, args.calib_cache_n_samples)
+            prompt_kwargs = _slice_cached_calib(prompt_kwargs, args.calib_cache_n_samples)
+    elif args.calib_data == "pileval":
         prompt_inputs, prompt_kwargs = get_calib_dataset(data_path=args.data_path, tokenizer=lm._tokenizer, n_samples=args.n_samples)
     elif args.calib_data == "coco":
         prompt_inputs, prompt_kwargs = get_multimodal_calib_dataset(data_path=args.data_path,
@@ -176,7 +229,11 @@ def cli_quant_single(args: Union[argparse.Namespace, None] = None) -> None:
                                                                     few_shot_format=args.few_shot_format,
                                                                     interleave_format=args.interleave_format,
                                                                     text_data_path=args.text_data_path,
-                                                                    micro_bs=args.micro_batch_size)
+                                                                    micro_bs=args.micro_batch_size,
+                                                                    image_size=args.calib_image_size or None,
+                                                                    max_images=args.calib_max_images or None,
+                                                                    image_chunk_size=args.calib_image_chunk_size or None,
+                                                                    prompt_text=args.calib_prompt or None)
     elif args.calib_data == "ocr_parquet":
         prompt_inputs, prompt_kwargs = get_ocr_parquet_calib_dataset(
             data_path=args.data_path,
@@ -211,6 +268,35 @@ def cli_quant_single(args: Union[argparse.Namespace, None] = None) -> None:
             coco_micro_bs=args.micro_batch_size,
             ocr_micro_bs=2,
         )
+
+    if args.calib_cache_path and not os.path.exists(args.calib_cache_path):
+        print(f"[calib-cache] Saving calibration inputs to {args.calib_cache_path}", flush=True)
+        os.makedirs(os.path.dirname(args.calib_cache_path), exist_ok=True)
+        torch.save(
+            {
+                "prompt_inputs": prompt_inputs,
+                "prompt_kwargs": prompt_kwargs,
+                "meta": {
+                    "model": args.model,
+                    "model_args": args.model_args,
+                    "calib_data": args.calib_data,
+                    "data_path": args.data_path,
+                    "image_folder": args.image_folder,
+                    "n_samples": args.n_samples,
+                    "micro_batch_size": args.micro_batch_size,
+                    "calib_image_size": args.calib_image_size,
+                    "calib_max_images": args.calib_max_images,
+                    "calib_image_chunk_size": args.calib_image_chunk_size,
+                    "calib_prompt": args.calib_prompt,
+                },
+            },
+            args.calib_cache_path,
+        )
+        print(f"[calib-cache] Saved calibration inputs to {args.calib_cache_path}", flush=True)
+
+    if args.calib_cache_only:
+        print("[calib-cache] Cache-only mode finished; skipping quantization.", flush=True)
+        return
 
     # Wrapper the quantized model.
     qwrapper(process_model, prompt_inputs, prompt_kwargs, args)

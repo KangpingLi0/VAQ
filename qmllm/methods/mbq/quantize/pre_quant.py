@@ -14,7 +14,8 @@ from transformers.models.opt.modeling_opt import OPTForCausalLM
 from transformers.models.llama.modeling_llama import LlamaForCausalLM
 
 from qmllm.utils.search import append_str_prefix, get_op_name
-from qmllm.utils.device import empty_cache, module_device
+from qmllm.utils.device import empty_cache, forward_module_in_batches, module_device, move_to_device
+from qmllm.utils.hf_compat import get_qwen_vl_layers, move_qwen_vl_embeddings
 
 from qmllm.methods.mbq.quantize.auto_scale_wa_distort import auto_scale_block_wa_distort
 from qmllm.methods.mbq.quantize.auto_scale_wa import auto_scale_block_wa
@@ -211,9 +212,9 @@ def get_blocks(model):
     elif model.__class__.__name__ == "InternVLChatModel":
         layers = model.language_model.model.layers
     elif model.__class__.__name__ == "Qwen2VLForConditionalGeneration":
-        layers = model.model.layers
+        layers = get_qwen_vl_layers(model)
     elif model.__class__.__name__ == "Qwen2_5_VLForConditionalGeneration":
-        layers = model.model.layers
+        layers = get_qwen_vl_layers(model)
     elif model.__class__.__name__ == "LlavaLlamaModel":
         layers = model.llm.model.layers
     elif isinstance(model, OPTForCausalLM):
@@ -271,9 +272,9 @@ def move_embed(model, device):
     elif model.__class__.__name__ == "InternVLChatModel":
         model.language_model.model.tok_embeddings = model.language_model.model.tok_embeddings.to(device)  
     elif model.__class__.__name__ == "Qwen2VLForConditionalGeneration":
-        model.model.embed_tokens = model.model.embed_tokens.to(device)
+        move_qwen_vl_embeddings(model, device)
     elif model.__class__.__name__ == "Qwen2_5_VLForConditionalGeneration":
-        model.model.embed_tokens = model.model.embed_tokens.to(device)
+        move_qwen_vl_embeddings(model, device)
     elif model.__class__.__name__ == "LlavaLlamaModel":
         model.llm.model.embed_tokens = model.llm.model.embed_tokens.to(device)
     else:
@@ -324,6 +325,8 @@ def run_mbq(
         def __init__(self, module):
             super().__init__()
             self.module = module
+            if hasattr(module, "attention_type"):
+                self.attention_type = module.attention_type
 
         def forward(self, inp, **kwargs):
             inps.append(inp)
@@ -334,6 +337,7 @@ def run_mbq(
     layers[0] = Catcher(layers[0])
 
     inputs, vision_mask, caption_mask = process_input(prompt_inputs, prompt_kwargs)
+    inputs = move_to_device(inputs, device)
 
     model.to_cuda()
     try:
@@ -343,8 +347,10 @@ def run_mbq(
 
     model.to_cpu()
     layers[0] = layers[0].module  # restore
-    inps = inps[0]
     layer_kwargs["use_cache"] = False
+    inps = inps[0].detach().cpu()
+    layer_kwargs = move_to_device(layer_kwargs, "cpu")
+    inputs = move_to_device(inputs, "cpu")
 
     layers[0] = layers[0].cpu()
     move_embed(model.model, "cpu")
@@ -368,6 +374,11 @@ def run_mbq(
         if hasattr(model, "lm_head"):
             for p in model.lm_head.parameters():
                 p.requires_grad_(False)
+
+        grad_checkpointing_enabled = False
+        if hasattr(model.model, "gradient_checkpointing_enable"):
+            model.model.gradient_checkpointing_enable()
+            grad_checkpointing_enabled = True
         
         if hasattr(model.model, "config"):
             model.model.config.use_cache = False
@@ -389,7 +400,8 @@ def run_mbq(
                 for k in inputs:
                     if isinstance(inputs[k], torch.Tensor):
                         mini_inputs[k] = inputs[k][i:i+mini_batch]
-                        
+
+                mini_inputs = move_to_device(mini_inputs, device)
                 mini_inputs["inputs_embeds"] = mini_inputs["inputs_embeds"].detach().requires_grad_(True)
                 mini_inputs["use_cache"] = False
                 mini_inputs["return_dict"] = True
@@ -400,8 +412,12 @@ def run_mbq(
 
                 loss = loss / accum_steps
                 loss.backward()
+                del mini_inputs, outputs, loss
+                empty_cache(device)
 
         model.to_cpu()
+        if grad_checkpointing_enabled and hasattr(model.model, "gradient_checkpointing_disable"):
+            model.model.gradient_checkpointing_disable()
         grad_avg_dict = grad_cache.get_avg_grad_dict()
         grad_cache.remove_hooks()
         del grad_cache
@@ -448,14 +464,10 @@ def run_mbq(
                     functools.partial(cache_input_hook, name=name, feat_dict=input_feat)
                 )
             )
-        inps = inps.to(next(layer.parameters()).device)  # in case multi-gpu
         # get output as next layer's input
 
-        for k in layer_kwargs:
-            if isinstance(layer_kwargs[k], torch.Tensor):
-                layer_kwargs[k] = layer_kwargs[k].to(next(layer.parameters()).device)
-
-        inps = layer(inps, **layer_kwargs)[0]
+        layer_device = next(layer.parameters()).device
+        inps = forward_module_in_batches(layer, inps, layer_kwargs, batch_size=1, device=layer_device)
         for h in handles:
             h.remove()
         # now solve for scaling
@@ -560,8 +572,8 @@ def run_mbq(
                         del new_linear, m
                         empty_cache(device)
                     
-                    inps_distort = inps_distort.to(next(layer_q.parameters()).device)  # in case multi-gpu
-                    inps_distort = layer_q(inps_distort, **layer_kwargs)[0]
+                    layer_q_device = next(layer_q.parameters()).device
+                    inps_distort = forward_module_in_batches(layer_q, inps_distort, layer_kwargs, batch_size=1, device=layer_q_device)
                     del layer_q 
                 else:
                     layer_q = copy.deepcopy(layer)
@@ -571,8 +583,8 @@ def run_mbq(
                         m.weight.data = pseudo_quantize_tensor(m.weight.data, n_bits=w_bit, **q_config)
                         empty_cache(device)
                     
-                    inps_distort = inps_distort.to(next(layer_q.parameters()).device)  # in case multi-gpu
-                    inps_distort = layer_q(inps_distort, **layer_kwargs)[0]
+                    layer_q_device = next(layer_q.parameters()).device
+                    inps_distort = forward_module_in_batches(layer_q, inps_distort, layer_kwargs, batch_size=1, device=layer_q_device)
                     del layer_q 
 
             # append prefix to make names global

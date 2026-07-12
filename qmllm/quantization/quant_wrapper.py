@@ -52,7 +52,7 @@ def qwrapper(model, prompt_inputs, prompt_kwargs, args):
                 pseudo_quant=args.pseudo_quant,
                 w_bit=args.w_bit,
                 q_group_size=args.w_group,
-                percdamp=args.percdamp,
+                percdamp=getattr(args, "percdamp", 0.01),
                 model_args=args.model_args,
                 model_type=args.model,
             )
@@ -64,7 +64,7 @@ def qwrapper(model, prompt_inputs, prompt_kwargs, args):
                 pseudo_quant=args.pseudo_quant,
                 w_bit=args.w_bit,
                 q_group_size=args.w_group,
-                percdamp=args.percdamp,
+                percdamp=getattr(args, "percdamp", 0.01),
             )
     else:
         raise NotImplementedError

@@ -13,7 +13,8 @@ from transformers.models.llama.modeling_llama import LlamaForCausalLM
 from qmllm.calibration.pileval import get_calib_dataset
 from qmllm.calibration.coco_vl import get_multimodal_calib_dataset
 from qmllm.utils.search import append_str_prefix, get_op_name
-from qmllm.utils.device import empty_cache, module_device
+from qmllm.utils.device import empty_cache, forward_module_in_batches, module_device, move_to_device
+from qmllm.utils.hf_compat import get_qwen_vl_layers, move_qwen_vl_embeddings
 
 from qmllm.methods.awq.quantize.auto_scale import auto_scale_block, apply_scale
 
@@ -37,9 +38,9 @@ def get_blocks(model):
     elif model.__class__.__name__ == "InternVLChatModel":
         layers = model.language_model.model.layers
     elif model.__class__.__name__ == "Qwen2VLForConditionalGeneration":
-        layers = model.model.layers
+        layers = get_qwen_vl_layers(model)
     elif model.__class__.__name__ == "Qwen2_5_VLForConditionalGeneration":
-        layers = model.model.layers
+        layers = get_qwen_vl_layers(model)
     elif model.__class__.__name__ == "LlavaLlamaModel":
         layers = model.llm.model.layers
     elif isinstance(model, OPTForCausalLM):
@@ -97,9 +98,9 @@ def move_embed(model, device):
     elif model.__class__.__name__ == "InternVLChatModel":
         model.language_model.model.tok_embeddings = model.language_model.model.tok_embeddings.to(device)  
     elif model.__class__.__name__ == "Qwen2VLForConditionalGeneration":
-        model.model.embed_tokens = model.model.embed_tokens.to(device)
+        move_qwen_vl_embeddings(model, device)
     elif model.__class__.__name__ == "Qwen2_5_VLForConditionalGeneration":
-        model.model.embed_tokens = model.model.embed_tokens.to(device)
+        move_qwen_vl_embeddings(model, device)
     elif model.__class__.__name__ == "LlavaLlamaModel":
         model.llm.model.embed_tokens = model.llm.model.embed_tokens.to(device)
     else:
@@ -145,6 +146,8 @@ def run_awq(
         def __init__(self, module):
             super().__init__()
             self.module = module
+            if hasattr(module, "attention_type"):
+                self.attention_type = module.attention_type
 
         def forward(self, inp, **kwargs):
             inps.append(inp)
@@ -154,6 +157,7 @@ def run_awq(
     # patch layer 0 to catch input and kwargs
     layers[0] = Catcher(layers[0])
     inputs, vision_mask, caption_mask = process_input(prompt_inputs, prompt_kwargs)
+    inputs = move_to_device(inputs, device)
 
     model.to_cuda()
     try:
@@ -163,8 +167,10 @@ def run_awq(
 
     model.to_cpu()
     layers[0] = layers[0].module  # restore
-    inps = inps[0]
     layer_kwargs["use_cache"] = False
+    inps = inps[0].detach().cpu()
+    layer_kwargs = move_to_device(layer_kwargs, "cpu")
+    inputs = move_to_device(inputs, "cpu")
 
     layers[0] = layers[0].cpu()
     move_embed(model.model, "cpu")
@@ -196,9 +202,9 @@ def run_awq(
                     functools.partial(cache_input_hook, name=name, feat_dict=input_feat)
                 )
             )
-        inps = inps.to(next(layer.parameters()).device)  # in case multi-gpu
         # get output as next layer's input
-        inps = layer(inps, **layer_kwargs)[0]
+        layer_device = next(layer.parameters()).device
+        inps = forward_module_in_batches(layer, inps, layer_kwargs, batch_size=1, device=layer_device)
         for h in handles:
             h.remove()
         # now solve for scaling

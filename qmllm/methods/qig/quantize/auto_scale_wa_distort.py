@@ -17,7 +17,15 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
 from .qmodule import ScaledActivation
 from .quantizer import get_module_by_name_suffix
 from qmllm.utils.search import get_op_by_name, get_op_name, set_op_by_name
-from qmllm.utils.device import empty_cache as _empty_cache
+from qmllm.utils.device import (
+    empty_cache as _empty_cache,
+    forward_module_in_batches,
+    get_act_scale_in_batches,
+    get_scale_search_batch_size,
+    move_to_device,
+    reconstruction_loss_in_batches,
+    slice_batch,
+)
 from qmllm.quantization.quant_funcs import pseudo_quantize_tensor
 from qmllm.quantization.qlinear import WALinear
 
@@ -159,17 +167,12 @@ def auto_scale_block_wa_distort(
            - forward and compute token-weighted loss vs baseline
            - restore original modules / state
         """
-        x = x.to(next(block.parameters()).device)
-        x_q = x_q.to(next(block.parameters()).device)
-
-        # Baseline output computed on x_q using the original (float) block
-        with torch.no_grad():
-            org_out = block(x_q, **kwargs)
-            if isinstance(org_out, tuple):
-                org_out = org_out[0]
+        device = next(block.parameters()).device
+        kwargs = kwargs or {}
+        batch_size = get_scale_search_batch_size(x.shape[0])
 
         # Build a quantized copy of the block (WALinear replacement)
-        block_q = copy.deepcopy(block)
+        block_q = copy.deepcopy(block).to(device)
 
         # Special case: if the "block" itself is a Linear (e.g., InternLM2 w2)
         if isinstance(block_q, nn.Linear):
@@ -217,6 +220,7 @@ def auto_scale_block_wa_distort(
 
             x = x.to(device, dtype=param_dtype)
             x_q = x_q.to(device, dtype=param_dtype)
+            kwargs = move_to_device(kwargs or {}, device)
             B, T, H = x.shape
 
             # Ensure use_cache does not interfere
@@ -306,14 +310,35 @@ def auto_scale_block_wa_distort(
 
             return weights_tok.detach(), iqr_vis
 
-        # Token weights: always compute with QIG to avoid any call-order / layer gating
-        token_w, _ = _compute_token_importance_weights(block, block_q, x, x_q, kwargs, loss_mode=loss_mode)
+        def _compute_token_importance_weights_batched(block_fp, block_q, x, x_q, kwargs, loss_mode="mae"):
+            total = x.shape[0]
+            chunks = []
+            for start in range(0, total, batch_size):
+                end = min(start + batch_size, total)
+                x_mb = x[start:end].to(device)
+                x_q_mb = x_q[start:end].to(device)
+                kwargs_mb = move_to_device(slice_batch(kwargs or {}, start, end, total), device)
+                token_mb, _ = _compute_token_importance_weights(
+                    block_fp,
+                    block_q,
+                    x_mb,
+                    x_q_mb,
+                    kwargs_mb,
+                    loss_mode=loss_mode,
+                )
+                chunks.append(token_mb.detach().cpu())
+                del x_mb, x_q_mb, kwargs_mb, token_mb
+                _empty_device_cache(device)
+            return torch.cat(chunks, dim=0), None
+
+        # Token weights: always compute with QIG to avoid any call-order / layer gating.
+        token_w, _ = _compute_token_importance_weights_batched(block, block_q, x, x_q, kwargs, loss_mode=loss_mode)
 
         # block_q is no longer needed after token weights are computed
         del block_q
         _empty_device_cache(_module_device(block))
 
-        x_max = get_act_scale(x_q)
+        x_max = get_act_scale_in_batches(x_q, batch_size=batch_size, device=device)
 
         best_error = float("inf")
         best_ratio = -1
@@ -321,6 +346,7 @@ def auto_scale_block_wa_distort(
 
         n_grid = 20
 
+        baseline_block = copy.deepcopy(block).to(device).eval()
         org_sd = {k: v.cpu() for k, v in block.state_dict().items()}
 
         for r in range(n_grid):
@@ -352,28 +378,30 @@ def auto_scale_block_wa_distort(
                 del new_fc
                 _empty_device_cache(_module_device(block))
 
-            # Input scaling (distort-style)
-            x_scale = x_q / (scales.view(1, 1, -1))
+            loss = reconstruction_loss_in_batches(
+                baseline_block,
+                baseline_x=x_q,
+                test_x=x_q,
+                kwargs=kwargs,
+                test_module=new_block if isinstance(block, nn.Linear) else block,
+                input_scales=scales,
+                token_w=token_w,
+                loss_mode=loss_mode,
+                batch_size=batch_size,
+                device=device,
+            )
+            if not torch.isfinite(torch.tensor(loss)):
+                for fc, fc_name in zip(linears2scale, layers_name):
+                    if isinstance(block, nn.Linear):
+                        continue
+                    setattr(block, fc_name, fc)
 
-            if isinstance(block, nn.Linear):
-                out = new_block(x_scale, **kwargs)
-            else:
-                out = block(x_scale, **kwargs)
+                if isinstance(block, nn.Linear):
+                    del new_block
 
-            if isinstance(out, tuple):
-                out = out[0]
-
-            eps = 1e-8
-            if loss_mode == "mse":
-                pos_change = (org_out - out).float().pow(2).mean(dim=-1)  # [B, T]
-            else:
-                pos_change = (org_out - out).float().abs().mean(dim=-1)  # [B, T]
-
-            # Keep original structure: sample_mag computed but not used in loss (as in your code)
-            sample_mag = pos_change.detach().mean(dim=1, keepdim=True).clamp_min(eps)
-            _ = token_w * sample_mag  # computed but intentionally unused to preserve original behavior
-
-            loss = (pos_change * token_w).sum() / token_w.sum().clamp_min(eps)
+                _empty_device_cache(_module_device(block))
+                block.load_state_dict(org_sd)
+                continue
 
             if loss < best_error:
                 best_error = loss
@@ -393,10 +421,15 @@ def auto_scale_block_wa_distort(
             block.load_state_dict(org_sd)
 
         if best_ratio == -1:
-            raise RuntimeError("Failed to find best ratio/scales in grid search.")
+            print(
+                "[WARN] QIG WA distort grid search produced no finite loss; "
+                "using neutral scales for this module."
+            )
+            best_scales = torch.ones_like(x_max).view(-1)
 
         best_scales = best_scales.view(-1)
         assert torch.isnan(best_scales).sum() == 0, best_scales
+        del baseline_block
         return best_scales.detach()
 
     def _auto_get_scale_wa_distort(
@@ -484,8 +517,15 @@ def auto_scale_block_wa_distort(
                 )
             )
 
-        inps_q = inps_q.to(next(new_module.parameters()).device)
-        new_module(inps_q, **module_kwargs)
+        module_device_ = next(new_module.parameters()).device
+        forward_module_in_batches(
+            new_module,
+            inps_q,
+            module_kwargs,
+            batch_size=1,
+            device=module_device_,
+            collect_output=False,
+        )
 
         for h in handles:
             h.remove()
@@ -751,7 +791,7 @@ def auto_scale_block_wa_distort(
             )
         )
 
-    elif module.__class__.__name__ in ("Qwen2DecoderLayer", "Qwen2VLDecoderLayer"):
+    elif module.__class__.__name__ in ("Qwen2DecoderLayer", "Qwen2VLDecoderLayer", "Qwen2_5_VLDecoderLayer"):
         input_feat_q = _auto_get_input_feat_distort(inps_q=q_input)
         scales_list.append(
             _auto_get_scale_wa_distort(

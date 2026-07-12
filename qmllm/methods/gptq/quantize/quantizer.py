@@ -66,12 +66,31 @@ class GPTQ:
         Losses = torch.zeros_like(W)
         Q = torch.zeros_like(W)
 
-        damp = percdamp * torch.mean(torch.diag(H))
+        mean_diag = torch.mean(torch.diag(H)).abs()
+        if not torch.isfinite(mean_diag) or mean_diag.item() == 0:
+            mean_diag = torch.ones((), device=self.dev, dtype=H.dtype)
+        damp = percdamp * mean_diag
         diag = torch.arange(self.columns, device=self.dev)
         H[diag, diag] += damp
         ori_type = H.dtype
         H = H.to(torch.float64)
-        H = torch.linalg.cholesky(H)
+        base_jitter = max(float(damp.detach().cpu()), float(mean_diag.detach().cpu()) * 1e-6, 1e-6)
+        last_err = None
+        for attempt in range(8):
+            try:
+                H = torch.linalg.cholesky(H)
+                break
+            except torch._C._LinAlgError as err:
+                last_err = err
+                jitter = base_jitter * (10 ** attempt)
+                logging.warning(
+                    "GPTQ Cholesky failed on attempt %s; adding diagonal jitter %.6g",
+                    attempt + 1,
+                    jitter,
+                )
+                H[diag, diag] += jitter
+        else:
+            raise last_err
         H = torch.cholesky_inverse(H)
         H = torch.linalg.cholesky(H, upper=True)
         H = H.to(ori_type)

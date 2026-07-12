@@ -1,4 +1,5 @@
 import gc
+import copy
 import torch
 import functools
 import torch.nn as nn
@@ -13,7 +14,14 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
 
 from .qmodule import ScaledActivation
 from qmllm.utils.search import get_op_by_name, get_op_name, set_op_by_name
-from qmllm.utils.device import empty_cache, module_device
+from qmllm.utils.device import (
+    empty_cache,
+    forward_module_in_batches,
+    get_act_scale_in_batches,
+    get_scale_search_batch_size,
+    module_device,
+    reconstruction_loss_in_batches,
+)
 from qmllm.quantization.quant_funcs import pseudo_quantize_tensor
 
 __all__ = ["auto_scale_block_distort", "apply_scale"]
@@ -113,14 +121,10 @@ def auto_scale_block_distort(module, module_kwargs, w_bit, q_config, input_feat,
     def _search_module_scale_distort(block, linears2scale: list, x, x_q, reweight_ratio=None, kwargs={}):
         # w: co, ci
         # x: n, ci
-        x = x.to(next(block.parameters()).device)
-        x_q = x_q.to(next(block.parameters()).device)
-        with torch.no_grad():
-            org_out = block(x, **kwargs)
-            if isinstance(org_out, tuple):
-                org_out = org_out[0]
-
-        x_max = get_act_scale(x_q)
+        device = next(block.parameters()).device
+        kwargs = kwargs or {}
+        batch_size = get_scale_search_batch_size(x.shape[0])
+        x_max = get_act_scale_in_batches(x_q, batch_size=batch_size, device=device)
 
         best_error = float("inf")
         best_ratio = -1
@@ -129,6 +133,7 @@ def auto_scale_block_distort(module, module_kwargs, w_bit, q_config, input_feat,
         n_grid = 20
         history = []
 
+        baseline_block = copy.deepcopy(block).to(device).eval()
         org_sd = {k: v.cpu() for k, v in block.state_dict().items()}
         for ratio in range(n_grid):
             ratio = ratio * 1 / n_grid
@@ -137,54 +142,19 @@ def auto_scale_block_distort(module, module_kwargs, w_bit, q_config, input_feat,
             for fc in linears2scale:
                 fc.weight.mul_(scales.view(1, -1).to(fc.weight.device))
                 fc.weight.data = w_quantize_func(fc.weight.data) / (scales.view(1, -1))
-            out = block(x_q, **kwargs)
-            if isinstance(out, tuple):
-                out = out[0]
-
-            # loss = (
-            #     (org_out - out).float().pow(2).mean().item()
-            # )  # float prevents overflow
-
-            if loss_mode == "mse":
-                if ans_mask is not None and vis_mask is not None:
-                    ans_mask_expand = ans_mask.unsqueeze(-1).expand_as(out).to(out.device)
-                    vis_mask_expand = vis_mask.unsqueeze(-1).expand_as(out).to(out.device)
-                    masked_diff_ans = ((org_out - out).float().pow(2) * ans_mask_expand)
-                    masked_diff_vis = ((org_out - out).float().pow(2) * vis_mask_expand)
-                    if reweight_ratio is not None:
-                        loss = masked_diff_ans.sum() / ans_mask_expand.sum() + reweight_ratio * (masked_diff_vis.sum() / vis_mask_expand.sum())
-                    else:
-                        loss = (
-                            (org_out - out).float().pow(2).mean().item()
-                        ) 
-                elif ans_mask is not None and vis_mask is None:
-                    ans_mask_expand = ans_mask.unsqueeze(-1).expand_as(out).to(out.device)
-                    masked_diff = ((org_out - out).float().pow(2) * ans_mask_expand)
-                    loss = masked_diff.sum() / ans_mask_expand.sum() 
-                else:
-                    loss = (
-                        (org_out - out).float().pow(2).mean().item()
-                    )  # float prevents overflow
-            elif loss_mode == "mae":
-                if ans_mask is not None and vis_mask is not None:
-                    ans_mask_expand = ans_mask.unsqueeze(-1).expand_as(out).to(out.device)
-                    vis_mask_expand = vis_mask.unsqueeze(-1).expand_as(out).to(out.device)
-                    masked_diff_ans = ((org_out - out).float().abs() * ans_mask_expand)
-                    masked_diff_vis = ((org_out - out).float().abs() * vis_mask_expand)
-                    if reweight_ratio is not None:
-                        loss = (masked_diff_ans.sum() + reweight_ratio * masked_diff_vis.sum()) / (ans_mask_expand.sum() + vis_mask_expand.sum())
-                    else:
-                        loss = (
-                            (org_out - out).float().abs().mean().item()
-                        ) 
-                elif ans_mask is not None and vis_mask is None:
-                    ans_mask_expand = ans_mask.unsqueeze(-1).expand_as(out).to(out.device)
-                    masked_diff = ((org_out - out).float().abs() * ans_mask_expand)
-                    loss = masked_diff.sum() / ans_mask_expand.sum() 
-                else:
-                    loss = (
-                        (org_out - out).float().abs().mean().item()
-                    )  # float prevents overflow
+            loss = reconstruction_loss_in_batches(
+                baseline_block,
+                baseline_x=x,
+                test_x=x_q,
+                kwargs=kwargs,
+                test_module=block,
+                ans_mask=ans_mask,
+                vis_mask=vis_mask,
+                reweight_ratio=reweight_ratio,
+                loss_mode=loss_mode,
+                batch_size=batch_size,
+                device=device,
+            )
 
             history.append(loss)
             is_best = loss < best_error
@@ -200,6 +170,7 @@ def auto_scale_block_distort(module, module_kwargs, w_bit, q_config, input_feat,
         best_scales = best_scales.view(-1)
 
         assert torch.isnan(best_scales).sum() == 0, best_scales
+        del baseline_block
         return best_scales.detach()
 
     def _auto_get_scale_distort(prev_op, layers, inp, inp_q, reweight_ratio=None, module2inspect=None, kwargs={}):
@@ -247,8 +218,15 @@ def auto_scale_block_distort(module, module_kwargs, w_bit, q_config, input_feat,
                 )
             )
 
-        inps_q = inps_q.to(next(module.parameters()).device)
-        module(inps_q, **module_kwargs)
+        module_device_ = next(module.parameters()).device
+        forward_module_in_batches(
+            module,
+            inps_q,
+            module_kwargs,
+            batch_size=1,
+            device=module_device_,
+            collect_output=False,
+        )
         for h in handles:
             h.remove()
     

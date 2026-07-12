@@ -6,6 +6,7 @@ from transformers.models.bloom.modeling_bloom import BloomForCausalLM
 from transformers.models.opt.modeling_opt import OPTForCausalLM
 from transformers.models.llama.modeling_llama import LlamaForCausalLM
 from qmllm.utils.device import empty_cache
+from qmllm.utils.hf_compat import get_qwen_vl_layers
 
 def quantize_opt(
     model, weight_quant="per_tensor", act_quant="per_tensor", w_bit=4, a_bit=8, quantize_bmm_input=True
@@ -251,9 +252,9 @@ def get_blocks(model):
     elif model.__class__.__name__ == "InternVLChatModel":
         layers = model.language_model.model.layers
     elif model.__class__.__name__ == "Qwen2VLForConditionalGeneration":
-        layers = model.model.layers
+        layers = get_qwen_vl_layers(model)
     elif model.__class__.__name__ == "Qwen2_5_VLForConditionalGeneration":
-        layers = model.model.layers
+        layers = get_qwen_vl_layers(model)
     elif model.__class__.__name__ == "LlavaLlamaModel":
         layers = model.llm.model.layers
     elif isinstance(model, OPTForCausalLM):

@@ -14,12 +14,18 @@ from transformers.models.opt.modeling_opt import OPTForCausalLM
 from transformers.models.llama.modeling_llama import LlamaForCausalLM
 
 from qmllm.utils.search import append_str_prefix, get_op_name
+from qmllm.utils.hf_compat import (
+    get_qwen_vl_layers,
+    move_qwen_vl_embeddings,
+    move_qwen_vl_rotary,
+)
 
 from qmllm.methods.qig.quantize.auto_scale_wa_distort import auto_scale_block_wa_distort
 from qmllm.methods.qig.quantize.auto_scale import auto_scale_block, apply_scale
 from qmllm.quantization.qlinear import WALinear
 from qmllm.quantization.quant_funcs import pseudo_quantize_tensor
-from utils.device import empty_cache, get_device, move_to_device
+from utils.device import get_device
+from qmllm.utils.device import empty_cache, forward_module_in_batches, move_to_device
 from .quantizer import get_module_by_name_suffix
 
 
@@ -31,46 +37,59 @@ class GradCacheHook:
         if vis_masks is None or cap_masks is None:
             raise ValueError
         self.hooks = []
-        self.vis_masks = vis_masks.cpu()
-        self.cap_masks = cap_masks.cpu()
-        self.steps = {}
-        self.grad_dict = {}
+        self.vis_masks_cpu = vis_masks.to(torch.bool).contiguous()
+        self.cap_masks_cpu = cap_masks.to(torch.bool).contiguous()
+        self._mask_cache = {}
+        self.ptr = {}
+        self.sum_vis = {}
+        self.sum_cap = {}
+        self.cnt = {}
 
+    def _get_masks_on(self, device):
+        if device not in self._mask_cache:
+            self._mask_cache[device] = (
+                self.vis_masks_cpu.to(device, non_blocking=True),
+                self.cap_masks_cpu.to(device, non_blocking=True),
+            )
+        return self._mask_cache[device]
 
+    @torch.no_grad()
     def cache_grad_hook(self, module, inp, out, name):
-        # initialize step counter, we use step counter to find the right mask for the grad
-        if name not in self.steps:
-            self.steps[name] = 0
+        output_grad = out[0]
+        if output_grad is None or output_grad.dim() != 3:
+            return
 
-        if name not in self.grad_dict:
-            self.grad_dict[name] = {"vis_grad": [], "cap_grad": []}
+        device = output_grad.device
+        vis_masks, cap_masks = self._get_masks_on(device)
+        batch, _, _ = output_grad.shape
+        start = self.ptr.get(name, 0)
+        end = start + batch
+        self.ptr[name] = end
 
-        output_grad = out[0].float()
-        step = self.steps[name]
+        vis_mask = vis_masks[start:end]
+        cap_mask = cap_masks[start:end]
+        grad_tok = output_grad.abs().mean(dim=-1).to(torch.float32)
 
-        B, N, C = output_grad.shape
+        def masked_mean(values, mask):
+            mask = mask.to(values.dtype)
+            denom = mask.sum(dim=1).clamp_min(1.0)
+            return (values * mask).sum(dim=1) / denom
 
-        for batch_idx in range(B):
-            vis_mask = self.vis_masks[step]
-            cap_mask = self.cap_masks[step]
+        vis_avg = masked_mean(grad_tok, vis_mask)
+        cap_avg = masked_mean(grad_tok, cap_mask)
 
-            vis_grad = output_grad[batch_idx][vis_mask]
-            cap_grad = output_grad[batch_idx][cap_mask]
+        if name not in self.sum_vis:
+            self.sum_vis[name] = torch.zeros((), device=device, dtype=torch.float32)
+            self.sum_cap[name] = torch.zeros((), device=device, dtype=torch.float32)
+            self.cnt[name] = 0
 
-            vis_grad_avg = vis_grad.abs().mean()
-            cap_grad_avg = cap_grad.abs().mean()
-
-            self.grad_dict[name]["vis_grad"].append(vis_grad_avg.detach().cpu())
-            self.grad_dict[name]["cap_grad"].append(cap_grad_avg.detach().cpu())
-
-            step = step + 1
-
-        self.steps[name] = step
-
+        self.sum_vis[name] += vis_avg.sum()
+        self.sum_cap[name] += cap_avg.sum()
+        self.cnt[name] += batch
 
     def register_hooks(self, layers):
         for n, m in layers.named_modules():
-            if isinstance(m, nn.Linear) and any([_ in n for _ in ["wo", "w2", "down_proj", "o_proj", "v_proj", "gate_proj", "up_proj", "w1", "w3"]]):
+            if isinstance(m, nn.Linear) and any([_ in n for _ in ["wo", "w2", "down_proj", "o_proj"]]):
                 # print(f"Registering hook for layer.{n}")
                 self.hooks.append(
                     m.register_full_backward_hook(
@@ -86,22 +105,17 @@ class GradCacheHook:
 
 
     def get_grad_dict(self):
-        return self.grad_dict
+        return self.get_avg_grad_dict()
     
 
     def get_avg_grad_dict(self):
-        avg_grad_dict = {}
-
-        for name, grad_values in self.grad_dict.items():
-            mean_vis = torch.mean(torch.stack(grad_values["vis_grad"]))
-            mean_cap = torch.mean(torch.stack(grad_values["cap_grad"]))
-
-            avg_grad_dict[name] = {
-                "vis_avg_grad": mean_vis.item(),
-                "cap_avg_grad": mean_cap.item()
+        out = {}
+        for name in self.sum_vis:
+            out[name] = {
+                "vis_avg_grad": (self.sum_vis[name] / max(self.cnt[name], 1)).detach().cpu().item(),
+                "cap_avg_grad": (self.sum_cap[name] / max(self.cnt[name], 1)).detach().cpu().item(),
             }
-
-        return avg_grad_dict
+        return out
     
 
 def get_named_linears(module):
@@ -121,10 +135,9 @@ def get_blocks(model):
     elif model.__class__.__name__ == "InternVLChatModel":
         layers = model.language_model.model.layers
     elif model.__class__.__name__ == "Qwen2VLForConditionalGeneration":
-        try:
-            layers = model.model.layers
-        except:
-            layers = model.model.language_model.layers
+        layers = get_qwen_vl_layers(model)
+    elif model.__class__.__name__ == "Qwen2_5_VLForConditionalGeneration":
+        layers = get_qwen_vl_layers(model)
     elif model.__class__.__name__ == "LlavaLlamaModel":
         layers = model.llm.model.layers
     elif isinstance(model, OPTForCausalLM):
@@ -183,10 +196,9 @@ def move_embed(model, device):
     elif model.__class__.__name__ == "InternVLChatModel":
         model.language_model.model.tok_embeddings = model.language_model.model.tok_embeddings.to(device)  
     elif model.__class__.__name__ == "Qwen2VLForConditionalGeneration":
-        try:
-            model.model.embed_tokens = model.model.embed_tokens.to(device)
-        except:
-            model.model.language_model.embed_tokens = model.model.language_model.embed_tokens.to(device)
+        move_qwen_vl_embeddings(model, device)
+    elif model.__class__.__name__ == "Qwen2_5_VLForConditionalGeneration":
+        move_qwen_vl_embeddings(model, device)
     elif model.__class__.__name__ == "LlavaLlamaModel":
         model.llm.model.embed_tokens = model.llm.model.embed_tokens.to(device)
     else:
@@ -231,6 +243,8 @@ def run_qig(
 
     layers[0] = layers[0].to(device)
     move_embed(model.model, 'cpu')
+    if model.model.__class__.__name__ == "Qwen2_5_VLForConditionalGeneration":
+        move_qwen_vl_rotary(model.model, device)
 
     # get input and kwargs to layer 0
     # with_kwargs is only supported in PyTorch 2.0
@@ -269,8 +283,10 @@ def run_qig(
 
     model.to_cpu()
     layers[0] = layers[0].module  # restore
-    inps = inps[0]
     layer_kwargs["use_cache"] = False
+    inps = inps[0].detach().cpu()
+    layer_kwargs = move_to_device(layer_kwargs, "cpu")
+    inputs = move_to_device(inputs, "cpu")
 
     layers[0] = layers[0].cpu()
     move_embed(model.model, "cpu")
@@ -288,6 +304,21 @@ def run_qig(
             model.to_device(device)
         else:
             model.to_cuda()
+
+        for p in model.model.parameters():
+            p.requires_grad_(False)
+        if hasattr(model, "lm_head"):
+            for p in model.lm_head.parameters():
+                p.requires_grad_(False)
+        grad_checkpointing_enabled = False
+        if hasattr(model.model, "gradient_checkpointing_enable"):
+            model.model.gradient_checkpointing_enable()
+            grad_checkpointing_enabled = True
+        if hasattr(model.model, "config"):
+            model.model.config.use_cache = False
+            model.model.config.output_attentions = False
+            model.model.config.output_hidden_states = False
+
         # save gradient
         grad_cache = GradCacheHook(vis_masks=vision_mask, cap_masks=caption_mask)        
         grad_cache.register_hooks(layers=layers)
@@ -296,21 +327,30 @@ def run_qig(
             mini_batch = 1
             total_samples = next(iter(prompt_inputs.values())).shape[0]
             accum_steps = int(total_samples/mini_batch)
+            model.model.zero_grad(set_to_none=True)
             
             for i in range(0, total_samples, mini_batch):
                 mini_inputs = {}
                 for k in inputs:
                     if isinstance(inputs[k], torch.Tensor):
                         mini_inputs[k] = inputs[k][i:i+mini_batch]
-                
+
+                mini_inputs = move_to_device(mini_inputs, device)
+                mini_inputs["inputs_embeds"] = mini_inputs["inputs_embeds"].detach().requires_grad_(True)
+                mini_inputs["use_cache"] = False
+                mini_inputs["return_dict"] = True
                 outputs = model(**mini_inputs)
 
                 loss = outputs[0]
 
                 loss = loss / accum_steps
                 loss.backward()
+                del mini_inputs, outputs, loss
+                empty_cache(device)
 
         model.to_cpu()
+        if grad_checkpointing_enabled and hasattr(model.model, "gradient_checkpointing_disable"):
+            model.model.gradient_checkpointing_disable()
         grad_avg_dict = grad_cache.get_avg_grad_dict()
         grad_cache.remove_hooks()
         del grad_cache
@@ -357,16 +397,10 @@ def run_qig(
                     functools.partial(cache_input_hook, name=name, feat_dict=input_feat)
                 )
             )
-        inps = inps.to(next(layer.parameters()).device)  # in case multi-gpu
         # get output as next layer's input
 
-        for k in layer_kwargs:
-            if isinstance(layer_kwargs[k], torch.Tensor):
-                layer_kwargs[k] = layer_kwargs[k].to(next(layer.parameters()).device)
-            if isinstance(layer_kwargs[k], tuple) or isinstance(layer_kwargs[k], list):
-                layer_kwargs[k] = [item.to(next(layer.parameters()).device) if torch.is_tensor(item) else item for item in layer_kwargs[k]]
-
-        inps = layer(inps, **layer_kwargs)[0]
+        layer_device = next(layer.parameters()).device
+        inps = forward_module_in_batches(layer, inps, layer_kwargs, batch_size=1, device=layer_device)
         for h in handles:
             h.remove()
         # now solve for scaling
@@ -443,8 +477,8 @@ def run_qig(
                         del new_linear, m
                         empty_cache(device)
                     
-                    inps_distort = inps_distort.to(next(layer_q.parameters()).device)  # in case multi-gpu
-                    inps_distort = layer_q(inps_distort, **layer_kwargs)[0]
+                    layer_q_device = next(layer_q.parameters()).device
+                    inps_distort = forward_module_in_batches(layer_q, inps_distort, layer_kwargs, batch_size=1, device=layer_q_device)
                     del layer_q
 
             # append prefix to make names global

@@ -17,7 +17,8 @@ from transformers.models.llama.modeling_llama import LlamaForCausalLM
 
 from qmllm.methods.gptq.quantize.qmodule import find_qlayers, WeightQuantizer
 from qmllm.methods.gptq.quantize.quantizer import GPTQ, cleanup_memory
-from qmllm.utils.device import empty_cache
+from qmllm.utils.device import empty_cache, forward_module_in_batches, move_to_device
+from qmllm.utils.hf_compat import get_qwen_vl_layers, move_qwen_vl_embeddings
 
 __all__ = ["run_gptq"]
 
@@ -50,12 +51,9 @@ def get_blocks(model):
     elif model.__class__.__name__ == "InternVLChatModel":
         layers = model.language_model.model.layers
     elif model.__class__.__name__ == "Qwen2VLForConditionalGeneration":
-        try:
-            layers = model.model.layers
-        except:
-            layers = model.model.language_model.layers
+        layers = get_qwen_vl_layers(model)
     elif model.__class__.__name__ == "Qwen2_5_VLForConditionalGeneration":
-        layers = model.model.language_model.layers
+        layers = get_qwen_vl_layers(model)
     elif model.__class__.__name__ == "LlavaLlamaModel":
         layers = model.llm.model.layers
     elif isinstance(model, OPTForCausalLM):
@@ -113,15 +111,9 @@ def move_embed(model, device):
     elif model.__class__.__name__ == "InternVLChatModel":
         model.language_model.model.tok_embeddings = model.language_model.model.tok_embeddings.to(device)  
     elif model.__class__.__name__ == "Qwen2VLForConditionalGeneration":
-        try:
-            model.model.embed_tokens = model.model.embed_tokens.to(device)
-            model.model.rotary_emb = model.model.rotary_emb.to(device)
-        except:
-            model.model.language_model.embed_tokens = model.model.language_model.embed_tokens.to(device)
-            model.model.language_model.rotary_emb = model.model.language_model.rotary_emb.to(device)
-            model.model.language_model.norm = model.model.language_model.norm.to(device) 
+        move_qwen_vl_embeddings(model, device)
     elif model.__class__.__name__ == "Qwen2_5_VLForConditionalGeneration":
-        model.model.language_model.embed_tokens = model.model.language_model.embed_tokens.to(device)
+        move_qwen_vl_embeddings(model, device)
     elif model.__class__.__name__ == "LlavaLlamaModel":
         model.llm.model.embed_tokens = model.llm.model.embed_tokens.to(device)
     elif model.__class__.__name__ == "Qwen2_VL":
@@ -161,17 +153,16 @@ def run_gptq(model,
     # if not torch.cuda.is_available() or torch.cuda.device_count() > 1:
     #     distribute_model(model)
     
+    device = torch.device(getattr(model, "device", DEV))
     layers = get_blocks(model.model)
 
-    move_embed(model.model, 'cpu')
-    
-    device = torch.device(getattr(model, "device", DEV))
-
     layers[0] = layers[0].to(device)
+    move_embed(model.model, device)
 
     dtype = next(iter(model.model.parameters())).dtype
 
     inputs, vision_mask, caption_mask = process_input(prompt_inputs, prompt_kwargs)
+    inputs = move_to_device(inputs, device)
     # nsamples = inputs['inputs_embeds'].shape[0]
 
     inps = []
@@ -200,13 +191,15 @@ def run_gptq(model,
         pass
     layers[0] = layers[0].module
     layer_kwargs["use_cache"] = False
+    layer_kwargs = move_to_device(layer_kwargs, "cpu")
     layers[0] = layers[0].cpu()
     move_embed(model.model, 'cpu')
+    inputs = move_to_device(inputs, "cpu")
     empty_cache(device)
 
     outs = deepcopy(inps)
     
-    inps = inps[0]
+    inps = inps[0].detach().cpu()
     # print(model.__class__.__name__)
 
     for i in tqdm.tqdm(range(len(layers)), desc="(GPTQ Quant.) Layers"):
@@ -231,12 +224,8 @@ def run_gptq(model,
                 return tmp
             handles = []
             handles.append(named_linears[name].register_forward_hook(add_batch(name)))
-            inps = inps.to(next(layer.parameters()).device)
-            for k in layer_kwargs:
-                if isinstance(layer_kwargs[k], torch.Tensor):
-                    layer_kwargs[k] = layer_kwargs[k].to(next(layer.parameters()).device)
-            inps = inps.to(next(layer.parameters()).device)
-            outs = layer(inps, **layer_kwargs)[0]
+            layer_device = next(layer.parameters()).device
+            outs = forward_module_in_batches(layer, inps, layer_kwargs, batch_size=1, device=layer_device)
             for h in handles:
                 h.remove()
             
@@ -247,7 +236,8 @@ def run_gptq(model,
             )
             gptq[name].free()
 
-        outs = layer(inps, **layer_kwargs)[0]
+        layer_device = next(layer.parameters()).device
+        outs = forward_module_in_batches(layer, inps, layer_kwargs, batch_size=1, device=layer_device)
         layers[i] = layer.cpu()
         del layer
         del gptq

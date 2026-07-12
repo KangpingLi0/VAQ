@@ -24,6 +24,7 @@ except ImportError:
 
 from PIL import Image, ImageFile, PngImagePlugin, UnidentifiedImageError
 
+from utils.device import get_device
 from qmllm.models.base import BaseModel
 from qmllm.utils.registry import MODEL_REGISTRY
 
@@ -41,6 +42,68 @@ class Qwen2_5_VL(BaseModel):
 
         self.num_params = sum(p.numel() for p in self.model.parameters())
         self.device_map = getattr(model, 'hf_device_map', {})
+        self.device = get_device("auto")
+
+    def set_device(self, device):
+        self.device = get_device(device)
+
+    def to_device(self, device=None):
+        if device is not None:
+            self.set_device(device)
+        target = str(self.device)
+        if getattr(self, "_current_device", None) == target:
+            return self
+        if self.device.type == "cuda":
+            self.to_cuda()
+        elif self.device.type == "npu":
+            self.model = self.model.to(device=self.device, dtype=torch.float16)
+        else:
+            self.model = self.model.to(self.device)
+        self._current_device = target
+        return self
+
+    def _get_input_embedding_layer(self):
+        if hasattr(self.model, "get_input_embeddings"):
+            try:
+                emb = self.model.get_input_embeddings()
+                if emb is not None:
+                    self._last_embedding_source = "self.model.get_input_embeddings()"
+                    return emb
+            except Exception:
+                pass
+
+        candidates = [
+            ("self.model", self.model),
+            ("self.model.model", getattr(self.model, "model", None)),
+            ("self.model.language_model", getattr(self.model, "language_model", None)),
+            (
+                "self.model.model.language_model",
+                getattr(getattr(self.model, "model", None), "language_model", None),
+            ),
+        ]
+
+        for source, obj in candidates:
+            if obj is None:
+                continue
+
+            if hasattr(obj, "get_input_embeddings"):
+                try:
+                    emb = obj.get_input_embeddings()
+                    if emb is not None:
+                        self._last_embedding_source = f"{source}.get_input_embeddings()"
+                        return emb
+                except Exception:
+                    pass
+
+            if hasattr(obj, "embed_tokens"):
+                self._last_embedding_source = f"{source}.embed_tokens"
+                return obj.embed_tokens
+
+        raise AttributeError(
+            "Cannot locate input embedding layer for Qwen2.5-VL. "
+            f"outer={type(self.model)}, "
+            f"inner={type(getattr(self.model, 'model', None))}"
+        )
 
     def fetch_vit(self):
         return self.model.vision_model
@@ -66,7 +129,7 @@ class Qwen2_5_VL(BaseModel):
         elif input_ids is not None:
             dev = input_ids.device
         else:
-            dev = self.model.model.embed_tokens.weight.device
+            dev = self._get_input_embedding_layer().weight.device
 
         if input_ids is not None:
             input_ids = input_ids.to(dev)
@@ -140,24 +203,28 @@ class Qwen2_5_VL(BaseModel):
 
     def to_cuda(self):
         # if self.num_params > 20 * 10 ** 9: # 20B model
-        if torch.cuda.device_count() > 1:
+        if self.device.type == "cuda" and torch.cuda.device_count() > 1:
             device_map = self.split_model(self.model.model.config.num_hidden_layers)
             self.model = dispatch_model(self.model, device_map=device_map)
             self._hooks_checked = False
+        elif self.device.type == "cuda":
+            self.model = self.model.to(self.device)
         else:
-            self.model = self.model.cuda()
+            self.model = self.model.to(self.device)
+        self._current_device = str(self.device)
 
     def to_cpu(self):
         if self.num_params > 20 * 10 ** 9: # 20B model
             remove_hook_from_submodules(self.model)
         self.model = self.model.cpu()
+        self._current_device = "cpu"
 
     def _ensure_dispatch_hooks_consistent(self):
         if getattr(self, "_hooks_checked", False):
             return
         self._hooks_checked = True
 
-        if torch.cuda.device_count() <= 1 or not getattr(self, "device_map", None):
+        if self.device.type != "cuda" or torch.cuda.device_count() <= 1 or not getattr(self, "device_map", None):
             return
 
         for _, m in self.model.named_modules():
@@ -178,25 +245,40 @@ class Qwen2_5_VL(BaseModel):
 
 
     def convert_data_item(self, data_item):
-        conversations = data_item["conversations"]
-        for conv in conversations:
-            if conv["from"] == "human":
-                user_text = conv["value"]
-                if "<image>" in user_text:
-                    user_text = user_text.replace("<image>", "")
-                if "\n" in user_text:
-                    user_text = user_text.replace("\n", "")
-            if conv["from"] == "gpt":
-                asst_text = conv["value"]
-        # Actually we don't use the image path here
-        image_path = data_item["image"]
+        user_text = ""
+        asst_text = ""
+
+        if "messages" in data_item:
+            for msg in data_item["messages"]:
+                role = msg.get("role")
+                if role in ("user", "human"):
+                    user_text = msg.get("content", "")
+                elif role in ("assistant", "gpt"):
+                    asst_text = msg.get("content", "")
+            image_path = data_item.get("images", data_item.get("image", []))
+        else:
+            conversations = data_item["conversations"]
+            for conv in conversations:
+                if conv["from"] == "human":
+                    user_text = conv["value"]
+                if conv["from"] == "gpt":
+                    asst_text = conv["value"]
+            image_path = data_item["image"]
+
+        if "<image>" in user_text:
+            user_text = user_text.replace("<image>", "")
+        if "\n" in user_text:
+            user_text = user_text.replace("\n", "")
+
+        if isinstance(image_path, list):
+            image_content = [{"type": "image", "image": path} for path in image_path]
+        else:
+            image_content = [{"type": "image", "image": image_path}]
+
         item = [
             {
                 "role": "user",
-                "content": [
-                    {"type": "image", "image": image_path},
-                    {"type": "text", "text": user_text},
-                ],
+                "content": image_content + [{"type": "text", "text": user_text}],
             },
             {
                 "role": "assistant",
@@ -364,7 +446,9 @@ class Qwen2_5_VL(BaseModel):
 
     @torch.no_grad()
     def generate_input(self, data_samples):
-        text_dev = self.model.model.embed_tokens.weight.device
+        self.to_device(self.device)
+        embed_layer = self._get_input_embedding_layer()
+        text_dev = embed_layer.weight.device
         vis_dev = next(self.model.visual.parameters()).device
 
         input_ids = data_samples["input_ids"].to(text_dev)
@@ -373,9 +457,11 @@ class Qwen2_5_VL(BaseModel):
 
         pixel_values = data_samples["pixel_values"].to(vis_dev, dtype=self.model.dtype)
         image_grid_thw = data_samples["image_grid_thw"].to(vis_dev)
+        if image_grid_thw.dim() > 2:
+            image_grid_thw = image_grid_thw.reshape(-1, image_grid_thw.shape[-1])
 
         # text embeddings on text_dev
-        inputs_embeds = self.model.model.embed_tokens(input_ids)
+        inputs_embeds = embed_layer(input_ids)
 
         # vision encoder on vis_dev
         visual_type = self.model.visual.blocks[0].mlp.down_proj.weight.dtype
@@ -445,16 +531,30 @@ class Qwen2_5_VL(BaseModel):
                     batch[k] = torch.tensor(np.stack([f[k] for f in instances]))
                 else:
                     batch[k] = torch.tensor([f[k] for f in instances])
-            if k in ('pixel_values'):
+            if k == 'pixel_values':
                 if isinstance(v, torch.Tensor):
                     batch[k] = torch.concat([f[k] for f in instances])
                 elif isinstance(v, np.ndarray):
                     batch[k] = torch.concat(np.stack([f[k] for f in instances]))
                 else:
                     batch[k] = torch.concat([f[k] for f in instances])
-            if k in ('image_grid_thw'):
+            if k == 'image_grid_thw':
                 if isinstance(v, torch.Tensor):
-                    batch[k] = torch.stack([f[k] for f in instances])
-            if k in ('sample_id'):
+                    grids = []
+                    for f in instances:
+                        grid = f[k]
+                        if grid.dim() == 1:
+                            grid = grid.unsqueeze(0)
+                        grids.append(grid)
+                    batch[k] = torch.cat(grids, dim=0)
+                elif isinstance(v, np.ndarray):
+                    grids = []
+                    for f in instances:
+                        grid = f[k]
+                        if grid.ndim == 1:
+                            grid = np.expand_dims(grid, axis=0)
+                        grids.append(grid)
+                    batch[k] = torch.tensor(np.concatenate(grids, axis=0))
+            if k == 'sample_id':
                 batch[k] = [f[k] for f in instances]
         return batch

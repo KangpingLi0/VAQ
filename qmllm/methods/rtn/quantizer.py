@@ -6,6 +6,7 @@ from qmllm.quantization.qlinear import WALinear
 from transformers.models.bloom.modeling_bloom import BloomForCausalLM
 from transformers.models.opt.modeling_opt import OPTForCausalLM
 from qmllm.utils.device import empty_cache
+from qmllm.utils.hf_compat import get_qwen_vl_layers
 
 def get_named_linears(module):
     return {name: m for name, m in module.named_modules() if isinstance(m, nn.Linear)}
@@ -24,7 +25,9 @@ def get_blocks(model):
     elif model.__class__.__name__ == "InternVLChatModel":
         layers = model.language_model.model.layers
     elif model.__class__.__name__ == "Qwen2VLForConditionalGeneration":
-        layers = model.model.layers
+        layers = get_qwen_vl_layers(model)
+    elif model.__class__.__name__ == "Qwen2_5_VLForConditionalGeneration":
+        layers = get_qwen_vl_layers(model)
     elif model.__class__.__name__ == "LlavaLlamaModel":
         layers = model.llm.model.layers
     elif isinstance(model, OPTForCausalLM):

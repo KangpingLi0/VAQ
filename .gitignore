@@ -17,3 +17,8 @@ __pycache__/
 *.pyc
 .DS_Store
 3rdparty/lmms-eval-new/
+*.json
+neijing/eval/*.json
+
+neijing/eval/results_eval/*.csv
+neijing/eval/results_eval/*.txt

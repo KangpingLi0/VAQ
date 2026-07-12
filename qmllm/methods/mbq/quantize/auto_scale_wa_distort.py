@@ -15,7 +15,14 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
 from .qmodule import ScaledActivation
 from .quantizer import get_module_by_name_suffix
 from qmllm.utils.search import get_op_by_name, get_op_name, set_op_by_name
-from qmllm.utils.device import empty_cache, module_device
+from qmllm.utils.device import (
+    empty_cache,
+    forward_module_in_batches,
+    get_act_scale_in_batches,
+    get_scale_search_batch_size,
+    module_device,
+    reconstruction_loss_in_batches,
+)
 from qmllm.quantization.quant_funcs import pseudo_quantize_tensor
 from qmllm.quantization.qlinear import WALinear
 
@@ -100,14 +107,10 @@ def auto_scale_block_wa_distort(module, module_kwargs, w_bit, a_bit, q_config, i
     def _search_module_scale_wa_distort(block, linears2scale: list, layers_name, x, x_q, reweight_ratio, kwargs={}):
         # w: co, ci
         # x: n, ci
-        x = x.to(next(block.parameters()).device)
-        x_q = x_q.to(next(block.parameters()).device)
-        with torch.no_grad():
-            org_out = block(x, **kwargs)
-            if isinstance(org_out, tuple):
-                org_out = org_out[0]
-
-        x_max = get_act_scale(x_q)
+        device = next(block.parameters()).device
+        kwargs = kwargs or {}
+        batch_size = get_scale_search_batch_size(x.shape[0])
+        x_max = get_act_scale_in_batches(x_q, batch_size=batch_size, device=device)
 
         best_error = float("inf")
         best_ratio = -1
@@ -116,6 +119,7 @@ def auto_scale_block_wa_distort(module, module_kwargs, w_bit, a_bit, q_config, i
         n_grid = 20
         history = []
 
+        baseline_block = copy.deepcopy(block).to(device).eval()
         org_sd = {k: v.cpu() for k, v in block.state_dict().items()}
         for ratio in range(n_grid):
             ratio = ratio * 1 / n_grid
@@ -138,60 +142,20 @@ def auto_scale_block_wa_distort(module, module_kwargs, w_bit, a_bit, q_config, i
                 del new_fc
                 empty_cache(block)
 
-            x_scale = x_q / (scales.view(1, 1, -1)) 
-
-            if isinstance(block, nn.Linear):
-                out = new_block(x_scale, **kwargs)
-            else:
-                out = block(x_scale, **kwargs)
-
-            if isinstance(out, tuple):
-                out = out[0]
-
-            # loss = (
-            #     (org_out - out).float().pow(2).mean().item()
-            # )  # float prevents overflow
-
-            if loss_mode == "mse":
-                if ans_mask is not None and vis_mask is not None:
-                    ans_mask_expand = ans_mask.unsqueeze(-1).expand_as(out).to(out.device)
-                    vis_mask_expand = vis_mask.unsqueeze(-1).expand_as(out).to(out.device)
-                    masked_diff_ans = ((org_out - out).float().pow(2) * ans_mask_expand)
-                    masked_diff_vis = ((org_out - out).float().pow(2) * vis_mask_expand)
-                    if reweight_ratio is not None:
-                        loss = masked_diff_ans.sum() / ans_mask_expand.sum() + reweight_ratio * (masked_diff_vis.sum() / vis_mask_expand.sum())
-                    else:
-                        loss = (
-                            (org_out - out).float().pow(2).mean().item()
-                        ) 
-                elif ans_mask is not None and vis_mask is None:
-                    ans_mask_expand = ans_mask.unsqueeze(-1).expand_as(out).to(out.device)
-                    masked_diff = ((org_out - out).float().pow(2) * ans_mask_expand)
-                    loss = masked_diff.sum() / ans_mask_expand.sum() 
-                else:
-                    loss = (
-                        (org_out - out).float().pow(2).mean().item()
-                    )  # float prevents overflow
-            elif loss_mode == "mae":
-                if ans_mask is not None and vis_mask is not None:
-                    ans_mask_expand = ans_mask.unsqueeze(-1).expand_as(out).to(out.device)
-                    vis_mask_expand = vis_mask.unsqueeze(-1).expand_as(out).to(out.device)
-                    masked_diff_ans = ((org_out - out).float().abs() * ans_mask_expand)
-                    masked_diff_vis = ((org_out - out).float().abs() * vis_mask_expand)
-                    if reweight_ratio is not None:
-                        loss = (masked_diff_ans.sum() + reweight_ratio * masked_diff_vis.sum()) / (ans_mask_expand.sum() + vis_mask_expand.sum())
-                    else:
-                        loss = (
-                            (org_out - out).float().abs().mean().item()
-                        ) 
-                elif ans_mask is not None and vis_mask is None:
-                    ans_mask_expand = ans_mask.unsqueeze(-1).expand_as(out).to(out.device)
-                    masked_diff = ((org_out - out).float().abs() * ans_mask_expand)
-                    loss = masked_diff.sum() / ans_mask_expand.sum() 
-                else:
-                    loss = (
-                        (org_out - out).float().abs().mean().item()
-                    )  # float prevents overflow
+            loss = reconstruction_loss_in_batches(
+                baseline_block,
+                baseline_x=x,
+                test_x=x_q,
+                kwargs=kwargs,
+                test_module=new_block if isinstance(block, nn.Linear) else block,
+                input_scales=scales,
+                ans_mask=ans_mask,
+                vis_mask=vis_mask,
+                reweight_ratio=reweight_ratio,
+                loss_mode=loss_mode,
+                batch_size=batch_size,
+                device=device,
+            )
 
             history.append(loss)
             is_best = loss < best_error
@@ -218,6 +182,7 @@ def auto_scale_block_wa_distort(module, module_kwargs, w_bit, a_bit, q_config, i
         best_scales = best_scales.view(-1)
 
         assert torch.isnan(best_scales).sum() == 0, best_scales
+        del baseline_block
         return best_scales.detach()
 
     def _auto_get_scale_wa_distort(prev_op, layers, layers_name, inp, inp_q, reweight_ratio, module2inspect=None, kwargs={}):
@@ -273,8 +238,15 @@ def auto_scale_block_wa_distort(module, module_kwargs, w_bit, a_bit, q_config, i
                 )
             )
 
-        inps_q = inps_q.to(next(new_module.parameters()).device)
-        new_module(inps_q, **module_kwargs)
+        module_device_ = next(new_module.parameters()).device
+        forward_module_in_batches(
+            new_module,
+            inps_q,
+            module_kwargs,
+            batch_size=1,
+            device=module_device_,
+            collect_output=False,
+        )
         for h in handles:
             h.remove()
     

@@ -12,7 +12,14 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm  # Used in app
 
 from qmllm.utils.search import get_op_by_name, get_op_name, set_op_by_name
 from qmllm.quantization.quant_funcs import pseudo_quantize_tensor
-from utils.device import empty_cache
+from qmllm.utils.device import (
+    empty_cache,
+    get_act_scale_in_batches,
+    get_scale_search_batch_size,
+    move_to_device,
+    reconstruction_loss_in_batches,
+    slice_batch,
+)
 
 __all__ = ["auto_scale_block", "apply_scale"]
 
@@ -126,15 +133,11 @@ def auto_scale_block(
         compute_token_importance=False,
     ):
         # x: [B, T, C]
-        x = x.to(next(block.parameters()).device)
+        device = next(block.parameters()).device
+        kwargs = kwargs or {}
+        batch_size = get_scale_search_batch_size(x.shape[0])
 
-        # Compute full-precision output baseline
-        with torch.no_grad():
-            org_out = block(x, **kwargs)
-            if isinstance(org_out, tuple):
-                org_out = org_out[0]
-
-        def _compute_token_importance_weights(block, x, x_q, kwargs):  # noqa: keep signature
+        def _compute_token_importance_weights(block, x, x_q, kwargs, block_q=None):  # noqa: keep signature
             """
             IGQ-aligned version:
             - Compute integrated gradients of the (y_fp - y_wq) signal
@@ -144,18 +147,20 @@ def auto_scale_block(
             device = next(block.parameters()).device
             param_dtype = next(block.parameters()).dtype
             x = x.to(device, dtype=param_dtype)
+            kwargs = move_to_device(kwargs or {}, device)
             B, T, H = x.shape
 
             # === Baseline input ===
             x0 = torch.zeros_like(x)
 
-            # === Build a quantized copy of the block ===
-            block_q = copy.deepcopy(block).to(device)
-            for m in block_q.modules():
-                if isinstance(m, nn.Linear):
-                    m.weight.data = pseudo_quantize_tensor(
-                        m.weight.data, n_bits=w_bit, **q_config
-                    ).detach()
+            owns_block_q = block_q is None
+            if owns_block_q:
+                block_q = copy.deepcopy(block).to(device)
+                for m in block_q.modules():
+                    if isinstance(m, nn.Linear):
+                        m.weight.data = pseudo_quantize_tensor(
+                            m.weight.data, n_bits=w_bit, **q_config
+                        ).detach()
 
             was_training_fp = block.training
             was_training_q = block_q.training
@@ -228,7 +233,8 @@ def auto_scale_block(
             if was_training_q:
                 block_q.train()
 
-            del block_q
+            if owns_block_q:
+                del block_q
             empty_cache(device)
             return token_w.detach(), iqr_vis
 
@@ -253,6 +259,27 @@ def auto_scale_block(
             token_w = valid_mask / valid_count
             return token_w
 
+        def _compute_token_importance_weights_batched(block, x, kwargs):
+            total = x.shape[0]
+            chunks = []
+            block_q = copy.deepcopy(block).to(device)
+            for m in block_q.modules():
+                if isinstance(m, nn.Linear):
+                    m.weight.data = pseudo_quantize_tensor(
+                        m.weight.data, n_bits=w_bit, **q_config
+                    ).detach()
+            for start in range(0, total, batch_size):
+                end = min(start + batch_size, total)
+                x_mb = x[start:end].to(device)
+                kwargs_mb = move_to_device(slice_batch(kwargs or {}, start, end, total), device)
+                token_mb, _ = _compute_token_importance_weights(block, x_mb, x_q=None, kwargs=kwargs_mb, block_q=block_q)
+                chunks.append(token_mb.detach().cpu())
+                del x_mb, kwargs_mb, token_mb
+                empty_cache(device)
+            del block_q
+            empty_cache(device)
+            return torch.cat(chunks, dim=0), None
+
         # Use a function attribute as a layer counter (keeps original intent)
         if not hasattr(auto_scale_block, "_layer_idx"):
             auto_scale_block._layer_idx = 0
@@ -261,7 +288,7 @@ def auto_scale_block(
         try:
             # Original behavior: use IGQ after the 10th call, otherwise uniform weights
             if layer_idx >= 9:
-                token_w, _ = _compute_token_importance_weights(block, x, x_q=None, kwargs=kwargs)
+                token_w, _ = _compute_token_importance_weights_batched(block, x, kwargs)
             else:
                 token_w = _uniform_weights(x, ans_mask, vis_mask)
         finally:
@@ -272,7 +299,7 @@ def auto_scale_block(
         auto_scale_block._layer_idx += 1
 
         # ---- Grid search with token-weighted loss ----
-        x_max = get_act_scale(x)
+        x_max = get_act_scale_in_batches(x, batch_size=batch_size, device=device)
         best_error = float("inf")
         best_ratio = -1
         best_scales = None
@@ -280,6 +307,7 @@ def auto_scale_block(
         history = []
 
         # Save/restore parameters for each grid candidate
+        baseline_block = copy.deepcopy(block).to(device).eval()
         org_sd = {k: v.detach().cpu() for k, v in block.state_dict().items()}
 
         for ratio in range(n_grid):
@@ -291,24 +319,21 @@ def auto_scale_block(
                 fc.weight.mul_(scales.view(1, -1).to(fc.weight.device))
                 fc.weight.data = w_quantize_func(fc.weight.data) / (scales.view(1, -1))
 
-            out = block(x, **kwargs)
-            if isinstance(out, tuple):
-                out = out[0]
+            loss_val = reconstruction_loss_in_batches(
+                baseline_block,
+                baseline_x=x,
+                kwargs=kwargs,
+                test_module=block,
+                token_w=token_w,
+                loss_mode=loss_mode,
+                batch_size=batch_size,
+                device=device,
+            )
 
-            # Per-token error aggregated over the last dimension.
-            # Per user request: ignore ans_mask/vis_mask here; rely only on IGQ weights.
-            if loss_mode == "mse":
-                pos_change = (org_out - out).float().pow(2).mean(dim=-1)
-            else:  # "mae"
-                pos_change = (org_out - out).float().abs().mean(dim=-1)
+            history.append((ratio, loss_val))
 
-            eps = 1e-8
-            loss_val = (pos_change * token_w).sum() / token_w.sum().clamp_min(eps)
-
-            history.append((ratio, float(loss_val)))
-
-            if float(loss_val) < best_error:
-                best_error = float(loss_val)
+            if loss_val < best_error:
+                best_error = loss_val
                 best_ratio = ratio
                 best_scales = scales
 
@@ -319,6 +344,7 @@ def auto_scale_block(
             print("Scale search history:", history)
             raise RuntimeError("Failed to find best ratio.")
 
+        del baseline_block
         return best_scales.view(-1).detach()
 
     # === Wrapper: produce (prev_op_name, layer_names, scales_cpu) ===
@@ -549,7 +575,7 @@ def auto_scale_block(
             )
         )
 
-    elif module.__class__.__name__ in ("Qwen2DecoderLayer", "Qwen2VLDecoderLayer"):
+    elif module.__class__.__name__ in ("Qwen2DecoderLayer", "Qwen2VLDecoderLayer", "Qwen2_5_VLDecoderLayer"):
         # Attention input
         scales_list.append(
             _auto_get_scale(

@@ -1,13 +1,118 @@
+import copy
 import os, json
 import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
 from datasets import load_dataset
+from qmllm.utils.device import empty_cache
 
-def load_image(image_path):
+def load_image(image_path, image_size=None):
     # Load the image using use PIL, we don't support tcs_loader
-    return Image.open(image_path).convert('RGB')
+    image = Image.open(image_path).convert('RGB')
+    if image_size is not None and image_size > 0:
+        image = image.resize((image_size, image_size), Image.Resampling.LANCZOS)
+    return image
+
+
+def override_user_prompt(data_item, prompt_text):
+    if not prompt_text:
+        return data_item
+
+    item = copy.deepcopy(data_item)
+    if "messages" in item:
+        found_user = False
+        for msg in item["messages"]:
+            if msg.get("role") in ("user", "human"):
+                msg["content"] = prompt_text
+                found_user = True
+                break
+        if not found_user:
+            item["messages"].insert(0, {"role": "user", "content": prompt_text})
+        return item
+
+    if "conversations" in item:
+        found_user = False
+        for conv in item["conversations"]:
+            if conv.get("from") in ("human", "user"):
+                conv["value"] = prompt_text
+                found_user = True
+                break
+        if not found_user:
+            item["conversations"].insert(0, {"from": "human", "value": prompt_text})
+        return item
+
+    item["conversations"] = [{"from": "human", "value": prompt_text}]
+    return item
+
+
+def limit_sample_images(data_item, max_images):
+    if not max_images or max_images <= 0:
+        return data_item
+
+    item = copy.deepcopy(data_item)
+    for key in ("image", "images"):
+        images = item.get(key)
+        if isinstance(images, list):
+            item[key] = images[:max_images]
+    return item
+
+
+def _get_sample_images(data_item):
+    images = data_item.get("image")
+    if not images:
+        images = data_item.get("images")
+    if isinstance(images, list):
+        return images
+    if images:
+        return [images]
+    return []
+
+
+def set_sample_images(data_item, images):
+    item = copy.deepcopy(data_item)
+    if "image" in item:
+        item["image"] = images
+    if "images" in item:
+        item["images"] = images
+    if "image" not in item and "images" not in item:
+        item["image"] = images
+    return item
+
+
+def split_sample_by_image_chunks(data_item, image_chunk_size):
+    if not image_chunk_size or image_chunk_size <= 0:
+        return [data_item]
+
+    images = _get_sample_images(data_item)
+    if len(images) <= image_chunk_size:
+        return [set_sample_images(data_item, images)]
+
+    chunks = []
+    for start in range(0, len(images), image_chunk_size):
+        chunk_images = images[start:start + image_chunk_size]
+        chunks.append(set_sample_images(data_item, chunk_images))
+    return chunks
+
+
+def build_calibration_items(dataset, n_samples, max_images=None, image_chunk_size=None):
+    items = []
+    total_images = 0
+    for i in range(n_samples):
+        idx = i % len(dataset)
+        data_item = limit_sample_images(dataset[idx], max_images)
+        image_count = len(_get_sample_images(data_item))
+        total_images += image_count
+        items.extend(split_sample_by_image_chunks(data_item, image_chunk_size))
+
+    if image_chunk_size and image_chunk_size > 0:
+        print(
+            "[calib] expanded "
+            f"{n_samples} source samples with {total_images} images "
+            f"into {len(items)} image chunks (chunk_size={image_chunk_size})",
+            flush=True,
+        )
+    return items
 
 
 def get_multimodal_calib_dataset(
@@ -20,6 +125,10 @@ def get_multimodal_calib_dataset(
     text_data_path=None,
     shuffle=True,
     micro_bs=16,
+    image_size=None,
+    max_images=None,
+    image_chunk_size=None,
+    prompt_text=None,
 ):
     # ------------- load dataset -------------
     if data_path.endswith(".jsonl"):
@@ -90,18 +199,27 @@ def get_multimodal_calib_dataset(
             return x_u8.to(torch.bool)
         return F.pad(x, (0, pad), value=pad_value)
 
-    # ------------- accumulate (pad-aware) -------------
-    prompt_inputs_all = None
-    prompt_kwargs_all = None
-    global_max_len = None
+    calib_items = build_calibration_items(
+        dataset,
+        n_samples=n_samples,
+        max_images=max_images,
+        image_chunk_size=image_chunk_size,
+    )
+    n_calib_items = len(calib_items)
 
-    for st in range(0, n_samples, micro_bs):
+    # ------------- accumulate CPU chunks; pad/copy once at the end -------------
+    chunks = []
+    global_max_len = 0
+    total_samples = 0
+
+    for st in range(0, n_calib_items, micro_bs):
         micro_data_list = []
-        ed = min(st + micro_bs, n_samples)
+        ed = min(st + micro_bs, n_calib_items)
+        print(f"[calib] building chunks {st}-{ed - 1} / {n_calib_items}", flush=True)
 
         for i in range(st, ed):
-            idx = i % len(dataset)
-            data_item = dataset[idx]
+            data_item = calib_items[i]
+            data_item = override_user_prompt(data_item, prompt_text)
 
             # load images
             if "image" in data_item and data_item["image"] and len(data_item["image"]) != 0:
@@ -109,10 +227,10 @@ def get_multimodal_calib_dataset(
                 if isinstance(data_item["image"], list):
                     for image_path in data_item["image"]:
                         full_image_path = os.path.join(image_folder, image_path)
-                        images.append(load_image(full_image_path))
+                        images.append(load_image(full_image_path, image_size=image_size))
                 else:
                     full_image_path = os.path.join(image_folder, data_item["image"])
-                    images.append(load_image(full_image_path))
+                    images.append(load_image(full_image_path, image_size=image_size))
             else:
                 images = None
 
@@ -127,57 +245,77 @@ def get_multimodal_calib_dataset(
         if interleave_format:
             examples = model.interleave_data_samples(examples, pure_text=pure_text)
 
-        # generate inputs on GPU (per your model.generate_input), then move to CPU for accumulation
+        # Generate each micro batch on the accelerator, then accumulate on CPU.
         prompt_inputs, prompt_kwargs = model.generate_input(examples)
 
-        cur_embeds = prompt_inputs["inputs_embeds"].detach()             # [B, N, C]
-        cur_labels = prompt_kwargs["labels"].detach()                    # [B, N]
-        cur_attn   = prompt_kwargs["attention_mask"].detach()            # [B, N]
-        cur_vmask  = prompt_kwargs["vision_mask"].detach()               # [B, N]
-        cur_cmask  = prompt_kwargs["caption_mask"].detach()              # [B, N]
+        cur_embeds = prompt_inputs["inputs_embeds"].detach().cpu()       # [B, N, C]
+        cur_labels = prompt_kwargs["labels"].detach().cpu()              # [B, N]
+        cur_attn   = prompt_kwargs["attention_mask"].detach().cpu()      # [B, N]
+        cur_vmask  = prompt_kwargs["vision_mask"].detach().cpu()         # [B, N]
+        cur_cmask  = prompt_kwargs["caption_mask"].detach().cpu()        # [B, N]
 
         cur_len = cur_embeds.size(1)
-
-        if prompt_inputs_all is None:
-            global_max_len = cur_len
-            prompt_inputs_all = {"inputs_embeds": cur_embeds}
-            prompt_kwargs_all = {
+        chunks.append(
+            {
+                "inputs_embeds": cur_embeds,
                 "labels": cur_labels,
                 "attention_mask": cur_attn,
                 "vision_mask": cur_vmask,
                 "caption_mask": cur_cmask,
             }
-        else:
-            target_len = max(global_max_len, cur_len)
-
-            # pad existing accumulated tensors if needed
-            if global_max_len != target_len:
-                prompt_inputs_all["inputs_embeds"] = pad_3d_to_len(prompt_inputs_all["inputs_embeds"], target_len, pad_value=0.0)
-                prompt_kwargs_all["labels"]        = pad_2d_to_len(prompt_kwargs_all["labels"], target_len, pad_value=-100)
-                prompt_kwargs_all["attention_mask"]= pad_2d_to_len(prompt_kwargs_all["attention_mask"], target_len, pad_value=False)
-                prompt_kwargs_all["vision_mask"]   = pad_2d_to_len(prompt_kwargs_all["vision_mask"], target_len, pad_value=False)
-                prompt_kwargs_all["caption_mask"]  = pad_2d_to_len(prompt_kwargs_all["caption_mask"], target_len, pad_value=False)
-                global_max_len = target_len
-
-            # pad current tensors if needed
-            if cur_len != global_max_len:
-                cur_embeds = pad_3d_to_len(cur_embeds, global_max_len, pad_value=0.0)
-                cur_labels = pad_2d_to_len(cur_labels, global_max_len, pad_value=-100)
-                cur_attn   = pad_2d_to_len(cur_attn,   global_max_len, pad_value=False)
-                cur_vmask  = pad_2d_to_len(cur_vmask,  global_max_len, pad_value=False)
-                cur_cmask  = pad_2d_to_len(cur_cmask,  global_max_len, pad_value=False)
-
-            # now cat along batch dim
-            prompt_inputs_all["inputs_embeds"] = torch.cat([prompt_inputs_all["inputs_embeds"], cur_embeds], dim=0)
-            prompt_kwargs_all["labels"]        = torch.cat([prompt_kwargs_all["labels"], cur_labels], dim=0)
-            prompt_kwargs_all["attention_mask"]= torch.cat([prompt_kwargs_all["attention_mask"], cur_attn], dim=0)
-            prompt_kwargs_all["vision_mask"]   = torch.cat([prompt_kwargs_all["vision_mask"], cur_vmask], dim=0)
-            prompt_kwargs_all["caption_mask"]  = torch.cat([prompt_kwargs_all["caption_mask"], cur_cmask], dim=0)
+        )
+        total_samples += cur_embeds.size(0)
+        global_max_len = max(global_max_len, cur_len)
 
         # cleanup
         del micro_data_list, examples, prompt_inputs, prompt_kwargs
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        empty_cache(getattr(model, "device", None))
+        print(f"[calib] accumulated {ed}/{n_calib_items}, max_len={global_max_len}", flush=True)
+
+    first_chunk = chunks[0]
+    hidden_size = first_chunk["inputs_embeds"].size(-1)
+    print(
+        f"[calib] finalizing {total_samples} samples, max_len={global_max_len}, hidden_size={hidden_size}",
+        flush=True,
+    )
+
+    prompt_inputs_all = {
+        "inputs_embeds": torch.zeros(
+            (total_samples, global_max_len, hidden_size),
+            dtype=first_chunk["inputs_embeds"].dtype,
+        )
+    }
+    prompt_kwargs_all = {
+        "labels": torch.full(
+            (total_samples, global_max_len),
+            -100,
+            dtype=first_chunk["labels"].dtype,
+        ),
+        "attention_mask": torch.zeros(
+            (total_samples, global_max_len),
+            dtype=first_chunk["attention_mask"].dtype,
+        ),
+        "vision_mask": torch.zeros(
+            (total_samples, global_max_len),
+            dtype=first_chunk["vision_mask"].dtype,
+        ),
+        "caption_mask": torch.zeros(
+            (total_samples, global_max_len),
+            dtype=first_chunk["caption_mask"].dtype,
+        ),
+    }
+
+    offset = 0
+    for chunk in chunks:
+        bs, cur_len = chunk["inputs_embeds"].shape[:2]
+        sl = slice(offset, offset + bs)
+        prompt_inputs_all["inputs_embeds"][sl, :cur_len] = chunk["inputs_embeds"]
+        prompt_kwargs_all["labels"][sl, :cur_len] = chunk["labels"]
+        prompt_kwargs_all["attention_mask"][sl, :cur_len] = chunk["attention_mask"]
+        prompt_kwargs_all["vision_mask"][sl, :cur_len] = chunk["vision_mask"]
+        prompt_kwargs_all["caption_mask"][sl, :cur_len] = chunk["caption_mask"]
+        offset += bs
+        chunk.clear()
+    chunks.clear()
 
     return prompt_inputs_all, prompt_kwargs_all
-

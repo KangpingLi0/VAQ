@@ -19,6 +19,7 @@ from typing import Union, List, Dict, Any
 
 from lmms_eval.models import get_model
 
+from utils.device import get_device
 from qmllm.quantization.quant_wrapper import qwrapper
 from qmllm.models import get_process_model
 from qmllm.calibration.pileval import get_calib_dataset
@@ -50,19 +51,21 @@ def parse_quant_infer_args() -> argparse.Namespace:
         "--device",
         type=str,
         default=None,
-        help="Device to use (e.g. cuda, cuda:0, cpu)",
+        help="Device to use (e.g. auto, npu, cuda, cpu)",
     )
     # calibration parameters
-    parser.add_argument("--calib_data", default="pileval", choices=["pileval", "coco", None])
+    parser.add_argument("--calib_data", default="none", choices=["pileval", "coco", "none", None])
     parser.add_argument("--n_samples", default=128, type=int)
     parser.add_argument("--data_path", default="", type=str)
     parser.add_argument("--image_folder", default="", type=str)
+    parser.add_argument("--calib_cache_path", default="", type=str)
+    parser.add_argument("--calib_cache_n_samples", default=0, type=int)
     parser.add_argument("--interleave_format", action="store_true")
     parser.add_argument("--few_shot_format", action="store_true")
     parser.add_argument("--text_data_path", default="", type=str)
 
     # TODO: quantization parameters
-    parser.add_argument("--method", default="awq", choices=["awq", "smoothquant", "mbq", "qig", "rtn", None])
+    parser.add_argument("--method", default="none", choices=["none", "fp16", "awq", "smoothquant", "mbq", "qig", "rtn", "gptq", None])
     parser.add_argument("--w_bit", default=8, type=int)
     parser.add_argument("--a_bit", default=16, type=int)
     parser.add_argument("--w_group", default=128, type=int)
@@ -73,6 +76,7 @@ def parse_quant_infer_args() -> argparse.Namespace:
     parser.add_argument("--scale_path", default=None, type=str)
     parser.add_argument("--run_process", action="store_true")
     parser.add_argument("--pseudo_quant", action="store_true")
+    parser.add_argument("--percdamp", default=0.01, type=float)
     
     ## inference parameters
     parser.add_argument("--infer_pairs", default=None, type=str,
@@ -87,6 +91,41 @@ def parse_quant_infer_args() -> argparse.Namespace:
     
     args = parser.parse_args()
     return args
+
+
+def _prepare_model_args_for_device(model_args: str, device) -> str:
+    if device.type != "npu":
+        return model_args
+
+    parts = [part for part in model_args.split(",") if part]
+    filtered = []
+    has_torch_dtype = False
+    for part in parts:
+        key = part.split("=", 1)[0].strip()
+        if key == "device_map":
+            continue
+        if key == "torch_dtype":
+            has_torch_dtype = True
+        filtered.append(part)
+    if not has_torch_dtype:
+        filtered.append("torch_dtype=float16")
+    return ",".join(filtered)
+
+
+def _slice_cached_calib(obj, n_samples: int):
+    if n_samples <= 0:
+        return obj
+    if torch.is_tensor(obj):
+        if obj.dim() > 0 and obj.shape[0] >= n_samples:
+            return obj[:n_samples].clone().contiguous()
+        return obj
+    if isinstance(obj, dict):
+        return {key: _slice_cached_calib(value, n_samples) for key, value in obj.items()}
+    if isinstance(obj, list):
+        return [_slice_cached_calib(value, n_samples) for value in obj]
+    if isinstance(obj, tuple):
+        return tuple(_slice_cached_calib(value, n_samples) for value in obj)
+    return obj
 
 
 def cli_quant(args: Union[argparse.Namespace, None] = None) -> None:
@@ -118,13 +157,16 @@ def cli_quant_single(args: Union[argparse.Namespace, None] = None) -> None:
     # here we load MLLMs outside of the evaluator.
     if args.model_args is None:
         args.model_args = ""
+    device = get_device(args.device or "auto")
+    args.torch_device = device
+    args.model_args = _prepare_model_args_for_device(args.model_args, device)
     
     ModelClass = get_model(args.model)
     lm = ModelClass.create_from_arg_string(
         args.model_args,
         {
             "batch_size": args.batch_size,
-            "device": args.device,
+            "device": str(device),
             # "use_flash_attention_2": False,
         },
     )
@@ -134,12 +176,22 @@ def cli_quant_single(args: Union[argparse.Namespace, None] = None) -> None:
     process_model = Process_ModelClass(lm._model, 
                                        lm._tokenizer, 
                                        lm.processor if hasattr(lm, 'processor') else None)
+    if hasattr(process_model, "set_device"):
+        process_model.set_device(device)
 
     # Generate the calibration tokens.
     prompt_inputs = None
     prompt_kwargs = None
 
-    if args.calib_data == "pileval":
+    if args.calib_cache_path and os.path.exists(args.calib_cache_path):
+        print(f"[calib-cache] Loading calibration inputs from {args.calib_cache_path}", flush=True)
+        calib_cache = torch.load(args.calib_cache_path, map_location="cpu")
+        prompt_inputs = calib_cache["prompt_inputs"]
+        prompt_kwargs = calib_cache["prompt_kwargs"]
+        if args.calib_cache_n_samples > 0:
+            prompt_inputs = _slice_cached_calib(prompt_inputs, args.calib_cache_n_samples)
+            prompt_kwargs = _slice_cached_calib(prompt_kwargs, args.calib_cache_n_samples)
+    elif args.calib_data == "pileval":
         prompt_inputs, prompt_kwargs = get_calib_dataset(data_path=args.data_path, tokenizer=lm._tokenizer, n_samples=args.n_samples)
     elif args.calib_data == "coco":
         prompt_inputs, prompt_kwargs = get_multimodal_calib_dataset(data_path=args.data_path,
@@ -149,9 +201,12 @@ def cli_quant_single(args: Union[argparse.Namespace, None] = None) -> None:
                                                                     few_shot_format=args.few_shot_format,
                                                                     interleave_format=args.interleave_format,
                                                                     text_data_path=args.text_data_path)
+    elif args.calib_data in ("none", None):
+        prompt_inputs, prompt_kwargs = None, None
 
     # Wrapper the quantized model.
-    qwrapper(process_model, prompt_inputs, prompt_kwargs, args)
+    if args.method not in ("none", "fp16", None):
+        qwrapper(process_model, prompt_inputs, prompt_kwargs, args)
     
     
     if args.infer_pairs and args.save_path:
@@ -180,7 +235,7 @@ def cli_quant_single(args: Union[argparse.Namespace, None] = None) -> None:
             do_sample=args.do_sample,
             model_args_str=args.model_args,
             quant_meta=quant_meta,
-            device=args.device or ("cuda" if torch.cuda.is_available() else "cpu"),
+            device=device,
         )
 
 #################### inferece ######################
@@ -232,6 +287,20 @@ def ensure_list_images(x):
     if x is None: return []
     if isinstance(x, (list, tuple)): return list(x)
     return [x]
+
+
+def make_result(item, idx, question, images, answer):
+    result = {
+        "id": item.get("id", idx),
+        "question": question,
+        "images": images,
+        "answer": answer,
+        "pred": answer,
+    }
+    for key in ("label", "date"):
+        if key in item:
+            result[key] = item[key]
+    return result
 
 def open_pils(paths: List[str]):
     imgs = []
@@ -364,12 +433,7 @@ def infer_llava_onevision(
             tail_ids = gen_ids[0][prompt_len:] if gen_ids.shape[1] > prompt_len else gen_ids[0]
             answer = tokenizer.decode(tail_ids, skip_special_tokens=True).strip()
 
-        results.append({
-            "id": data_item["id"],
-            "question": q,
-            "images": img_paths,
-            "answer": answer
-        })
+        results.append(make_result(item, i, q, img_paths, answer))
 
     return results
 
@@ -433,12 +497,7 @@ def infer_internvl2(
         tail_ids   = gen_ids[0][prompt_len:] if gen_ids.shape[1] > prompt_len else gen_ids[0]
         ans        = tokenizer.decode(tail_ids, skip_special_tokens=True).strip()
 
-        results.append({
-            "id": data_item["id"],
-            "question": q,
-            "images": img_paths,
-            "answer": ans
-        })
+        results.append(make_result(item, i, q, img_paths, ans))
 
     return results
 
@@ -516,12 +575,7 @@ def infer_qwen2_vl(
         if ans.lower().startswith("assistant"):
             ans = ans[len("assistant"):].lstrip(":： \n\t")
 
-        results.append({
-            "id": item.get("id", i),
-            "question": q,
-            "images": img_paths,
-            "answer": ans
-        })
+        results.append(make_result(item, i, q, img_paths, ans))
     return results
 
 
@@ -564,7 +618,7 @@ def run_inference(
             temperature=temperature,
             do_sample=do_sample
         )
-    elif arch.lower() == "qwen2_vl":
+    elif arch.lower() in ("qwen2_vl", "qwen2_5_vl"):
         outputs = infer_qwen2_vl(
             proc_model=process_model,
             raw_model=lm_model,
