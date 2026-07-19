@@ -108,7 +108,7 @@ def parse_quant_args() -> argparse.Namespace:
     parser.add_argument("--w_bit", default=8, type=int)
     parser.add_argument("--a_bit", default=16, type=int)
     parser.add_argument("--w_group", default=128, type=int)
-    parser.add_argument("--alpha", default=0.5, type=int)
+    parser.add_argument("--alpha", default=0.5, type=float)
     parser.add_argument("--reweight", action="store_true")
     parser.add_argument("--distort", action="store_true")
     parser.add_argument("--loss_mode", default="mae", choices=["mae", "mse"])

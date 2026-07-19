@@ -251,9 +251,11 @@ def get_blocks(model):
         layers = model.model.layers
     elif model.__class__.__name__ == "InternVLChatModel":
         layers = model.language_model.model.layers
-    elif model.__class__.__name__ == "Qwen2VLForConditionalGeneration":
-        layers = get_qwen_vl_layers(model)
-    elif model.__class__.__name__ == "Qwen2_5_VLForConditionalGeneration":
+    elif model.__class__.__name__ in (
+        "Qwen2VLForConditionalGeneration",
+        "Qwen2_5_VLForConditionalGeneration",
+        "Qwen3VLForConditionalGeneration",
+    ):
         layers = get_qwen_vl_layers(model)
     elif model.__class__.__name__ == "LlavaLlamaModel":
         layers = model.llm.model.layers

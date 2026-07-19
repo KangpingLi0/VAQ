@@ -11,6 +11,7 @@ from qmllm.models.llava_v15 import LLaVA_v15
 from qmllm.models.qwen2_vl import Qwen2_VL
 from qmllm.models.vila import vila
 from qmllm.models.qwen2_5_vl import Qwen2_5_VL
+from qmllm.models.qwen3_vl import Qwen3_VL
 
 from qmllm.utils.registry import MODEL_REGISTRY
 

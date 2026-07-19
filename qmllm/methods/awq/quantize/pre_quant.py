@@ -37,9 +37,11 @@ def get_blocks(model):
         layers = model.model.layers
     elif model.__class__.__name__ == "InternVLChatModel":
         layers = model.language_model.model.layers
-    elif model.__class__.__name__ == "Qwen2VLForConditionalGeneration":
-        layers = get_qwen_vl_layers(model)
-    elif model.__class__.__name__ == "Qwen2_5_VLForConditionalGeneration":
+    elif model.__class__.__name__ in (
+        "Qwen2VLForConditionalGeneration",
+        "Qwen2_5_VLForConditionalGeneration",
+        "Qwen3VLForConditionalGeneration",
+    ):
         layers = get_qwen_vl_layers(model)
     elif model.__class__.__name__ == "LlavaLlamaModel":
         layers = model.llm.model.layers
@@ -97,9 +99,11 @@ def move_embed(model, device):
         model.model.tok_embeddings = model.model.tok_embeddings.to(device)
     elif model.__class__.__name__ == "InternVLChatModel":
         model.language_model.model.tok_embeddings = model.language_model.model.tok_embeddings.to(device)  
-    elif model.__class__.__name__ == "Qwen2VLForConditionalGeneration":
-        move_qwen_vl_embeddings(model, device)
-    elif model.__class__.__name__ == "Qwen2_5_VLForConditionalGeneration":
+    elif model.__class__.__name__ in (
+        "Qwen2VLForConditionalGeneration",
+        "Qwen2_5_VLForConditionalGeneration",
+        "Qwen3VLForConditionalGeneration",
+    ):
         move_qwen_vl_embeddings(model, device)
     elif model.__class__.__name__ == "LlavaLlamaModel":
         model.llm.model.embed_tokens = model.llm.model.embed_tokens.to(device)

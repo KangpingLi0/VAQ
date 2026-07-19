@@ -69,7 +69,7 @@ def parse_quant_infer_args() -> argparse.Namespace:
     parser.add_argument("--w_bit", default=8, type=int)
     parser.add_argument("--a_bit", default=16, type=int)
     parser.add_argument("--w_group", default=128, type=int)
-    parser.add_argument("--alpha", default=0.5, type=int)
+    parser.add_argument("--alpha", default=0.5, type=float)
     parser.add_argument("--reweight", action="store_true")
     parser.add_argument("--distort", action="store_true")
     parser.add_argument("--loss_mode", default="mae", choices=["mae", "mse"])
@@ -210,18 +210,26 @@ def cli_quant_single(args: Union[argparse.Namespace, None] = None) -> None:
     
     
     if args.infer_pairs and args.save_path:
-        quant_meta = {
-            "method": args.method,
-            "w_bit": args.w_bit,
-            "a_bit": args.a_bit,
-            "w_group": args.w_group,
-            "alpha": args.alpha,
-            "reweight": bool(args.reweight),
-            "distort": bool(args.distort),
-            "loss_mode": args.loss_mode,
-            "scale_path": args.scale_path,
-            "pseudo_quant": bool(args.pseudo_quant),
-        }
+        if args.method in ("none", "fp16", None):
+            quant_meta = {
+                "method": args.method,
+                "weight_dtype": "fp16",
+                "activation_dtype": "fp16",
+                "pseudo_quant": False,
+            }
+        else:
+            quant_meta = {
+                "method": args.method,
+                "w_bit": args.w_bit,
+                "a_bit": args.a_bit,
+                "w_group": args.w_group,
+                "alpha": args.alpha,
+                "reweight": bool(args.reweight),
+                "distort": bool(args.distort),
+                "loss_mode": args.loss_mode,
+                "scale_path": args.scale_path,
+                "pseudo_quant": bool(args.pseudo_quant),
+            }
 
         run_inference(
             arch=args.model,
