@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import re
 from datetime import datetime
@@ -28,6 +29,8 @@ METHOD_ORDER = [
     "w4a16_qig",
     "w4a8_rtn",
     "w4a8_smoothquant",
+    "w4a8_smoothquant_alpha0p25_20260714_100302",
+    "w4a8_smoothquant_alpha0p75_20260714_100302",
     "w4a8_mbq",
     "w4a8_qig",
     "w3a16_rtn",
@@ -67,6 +70,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-root", type=Path, default=DEFAULT_RUN_ROOT)
     parser.add_argument("--eval-root", type=Path, default=None)
     parser.add_argument("--out", type=Path, default=None)
+    parser.add_argument("--csv-out", type=Path, default=None)
+    parser.add_argument("--md-out", type=Path, default=None)
     return parser.parse_args()
 
 
@@ -289,6 +294,112 @@ def collect(eval_root: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]
     return sorted(rows, key=order_key), gt_rows, label_rows
 
 
+def write_csv_summary(
+    rows: list[dict[str, Any]],
+    path: Path,
+    method_order: list[str] | None = None,
+) -> None:
+    metric_groups = [
+        "overall_level1",
+        "desc_level1",
+        "conclu_level1",
+        "overall_level2",
+        "overall_level3",
+    ]
+    keys = ["method", "status", "sample_count"]
+    for metric in metric_groups:
+        keys.extend([f"{metric}_precision", f"{metric}_recall", f"{metric}_f1"])
+    keys.extend(
+        [
+            "conclu_level1_disease_micro_sensitivity",
+            "conclu_level1_disease_micro_specificity",
+            "conclu_level1_disease_micro_f1",
+            "conclu_level1_disease_macro_sensitivity",
+            "conclu_level1_disease_macro_specificity",
+            "conclu_level1_disease_macro_f1",
+            "conclu_level1_case_miss_rate",
+            "conclu_level1_case_recall_all",
+            "conclu_level1_case_exact_match",
+            "delta_overall_level1_f1_vs_fp16",
+            "overall_level1_f1_retention_pct",
+        ]
+    )
+
+    selected_methods = method_order or METHOD_ORDER
+    primary_rows = [row for row in rows if row["method_id"] in selected_methods]
+    primary_rows.sort(key=lambda row: selected_methods.index(row["method_id"]))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=keys)
+        writer.writeheader()
+        for row in primary_rows:
+            out = {
+                "method": row["method_id"],
+                "status": "DONE" if row.get("metrics_exists") else row["usable_status"],
+                "sample_count": row.get("sample_count"),
+            }
+            for key in keys[3:-2]:
+                value = row.get(key)
+                out[key] = f"{value:.4f}" if isinstance(value, float) else value
+            delta = row.get("delta_overall_l1_f1_vs_fp16")
+            retention = row.get("overall_l1_f1_retention_vs_fp16")
+            out["delta_overall_level1_f1_vs_fp16"] = (
+                f"{delta:.4f}" if delta is not None else ""
+            )
+            out["overall_level1_f1_retention_pct"] = (
+                f"{retention * 100:.2f}" if retention is not None else ""
+            )
+            writer.writerow(out)
+
+
+def write_md_summary(
+    rows: list[dict[str, Any]],
+    path: Path,
+    method_order: list[str] | None = None,
+) -> None:
+    selected_methods = method_order or METHOD_ORDER
+    primary_rows = [row for row in rows if row["method_id"] in selected_methods]
+    primary_rows.sort(key=lambda row: selected_methods.index(row["method_id"]))
+    headers = [
+        "Method",
+        "Status",
+        "N",
+        "Overall L1 F1",
+        "Delta vs FP16",
+        "Retention",
+        "Desc L1 F1",
+        "Conclu L1 F1",
+        "Disease Micro F1",
+        "Case Recall@all",
+        "Case Exact",
+    ]
+
+    def fmt(value: Any) -> str:
+        return f"{value:.4f}" if isinstance(value, float) else str(value or "")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        handle.write("| " + " | ".join(headers) + " |\n")
+        handle.write("|" + "|".join(["---"] * len(headers)) + "|\n")
+        for row in primary_rows:
+            delta = row.get("delta_overall_l1_f1_vs_fp16")
+            retention = row.get("overall_l1_f1_retention_vs_fp16")
+            values = [
+                row["method_id"],
+                "DONE" if row.get("metrics_exists") else row["usable_status"],
+                row.get("sample_count"),
+                row.get("overall_level1_f1"),
+                f"{delta:+.4f}" if delta is not None else "",
+                f"{retention * 100:.2f}%" if retention is not None else "",
+                row.get("desc_level1_f1"),
+                row.get("conclu_level1_f1"),
+                row.get("conclu_level1_disease_micro_f1"),
+                row.get("conclu_level1_case_recall_all"),
+                row.get("conclu_level1_case_exact_match"),
+            ]
+            handle.write("| " + " | ".join(fmt(value) for value in values) + " |\n")
+
+
 def write_table(ws, rows: list[dict[str, Any]], cols: list[tuple[str, str]], table_name: str | None = None) -> None:
     header_fill = PatternFill("solid", fgColor="1F4E78")
     header_font = Font(color="FFFFFF", bold=True)
@@ -441,11 +552,33 @@ def main() -> None:
     args = parse_args()
     eval_root = args.eval_root or args.run_root / "eval_test3100"
     out = args.out or eval_root / "quantization_results_summary_latest.xlsx"
+    csv_out = args.csv_out or eval_root / "metrics_summary.csv"
+    md_out = args.md_out or eval_root / "metrics_summary.md"
     rows, gt_rows, label_rows = collect(eval_root)
     wb = build_workbook(rows, gt_rows, label_rows, eval_root)
     out.parent.mkdir(parents=True, exist_ok=True)
     wb.save(out)
+    write_csv_summary(rows, csv_out)
+    write_md_summary(rows, md_out)
+    w3w2_order = [
+        "w3a16_rtn",
+        "w3a16_gptq",
+        "w3a16_awq",
+        "w3a16_mbq",
+        "w3a16_qig",
+        "w2a16_awq",
+        "w2a16_mbq",
+        "w2a16_qig",
+    ]
+    w3w2_csv = eval_root / "metrics_summary_w3w2_a16.csv"
+    w3w2_md = eval_root / "metrics_summary_w3w2_a16.md"
+    write_csv_summary(rows, w3w2_csv, w3w2_order)
+    write_md_summary(rows, w3w2_md, w3w2_order)
     print(f"[OK] wrote {out}")
+    print(f"[OK] wrote {csv_out}")
+    print(f"[OK] wrote {md_out}")
+    print(f"[OK] wrote {w3w2_csv}")
+    print(f"[OK] wrote {w3w2_md}")
     print(f"[OK] rows={len(rows)} gt_rows={len(gt_rows)} label_rows={len(label_rows)}")
 
 
