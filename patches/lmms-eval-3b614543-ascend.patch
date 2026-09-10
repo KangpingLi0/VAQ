@@ -1,0 +1,287 @@
+diff --git a/lmms_eval/models/simple/internvl2.py b/lmms_eval/models/simple/internvl2.py
+index 444ea597..5280bacb 100644
+--- a/lmms_eval/models/simple/internvl2.py
++++ b/lmms_eval/models/simple/internvl2.py
+@@ -132,12 +132,79 @@ def load_video(video_path, bound=None, input_size=448, max_num=1, num_segments=3
+ 
+ 
+ import math
++import types
+ from datetime import timedelta
+ 
+ from accelerate.state import AcceleratorState
+ from accelerate.utils import InitProcessGroupKwargs
+ 
+ 
++def _ensure_internlm2_generation_compat(model):
++    """Bridge old InternLM2 remote code to modern Transformers generation.
++
++    Transformers 4.50 stopped making every PreTrainedModel inherit
++    GenerationMixin, while InternVL2/2.5 checkpoints still rely on that old
++    behavior.  Newer generation code may also provide an unpopulated legacy
++    KV-cache container on its first step.  Apply both compatibility fixes once
++    at model load so every lmms task and every quantization method sees the
++    same corrected language model.
++    """
++    language_model = model.language_model
++    if not hasattr(language_model, "generate"):
++        from transformers.generation import GenerationConfig, GenerationMixin
++
++        compat_class = type(
++            f"{language_model.__class__.__name__}WithGenerationMixin",
++            (language_model.__class__, GenerationMixin),
++            {},
++        )
++        language_model.__class__ = compat_class
++        if getattr(language_model, "generation_config", None) is None:
++            language_model.generation_config = GenerationConfig.from_model_config(
++                language_model.config
++            )
++
++    if getattr(language_model, "_qig_generation_compat", False):
++        return model
++
++    original_prepare = language_model.prepare_inputs_for_generation
++
++    def prepare_inputs_for_generation(
++        self,
++        input_ids,
++        past_key_values=None,
++        attention_mask=None,
++        inputs_embeds=None,
++        **kwargs,
++    ):
++        if past_key_values is not None:
++            past_length = 0
++            if hasattr(past_key_values, "get_seq_length"):
++                past_length = past_key_values.get_seq_length()
++            else:
++                try:
++                    first_key = past_key_values[0][0]
++                    if first_key is not None:
++                        past_length = first_key.shape[2]
++                except (IndexError, TypeError, AttributeError):
++                    pass
++            if past_length == 0:
++                past_key_values = None
++        return original_prepare(
++            input_ids,
++            past_key_values=past_key_values,
++            attention_mask=attention_mask,
++            inputs_embeds=inputs_embeds,
++            **kwargs,
++        )
++
++    language_model.prepare_inputs_for_generation = types.MethodType(
++        prepare_inputs_for_generation, language_model
++    )
++    language_model._qig_generation_compat = True
++    return model
++
++
+ # The reason for writing the code this way is to avoid errors that occur during multi-GPU inference due to tensors not being on the same device. By ensuring that the first and last layers of the large language model (LLM) are on the same device, we prevent such errors.
+ def split_model(model_name, num_layers=None):
+     device_map = {}
+@@ -205,16 +272,24 @@ class InternVL2(lmms):
+         accelerator_kwargs = InitProcessGroupKwargs(timeout=timedelta(weeks=52))
+         accelerator = Accelerator(kwargs_handlers=[accelerator_kwargs])
+         self.accelerator = accelerator
++        requested_device = torch.device(device)
++        device_type = requested_device.type
+         if accelerator.num_processes > 1:
+-            self._device = torch.device(f"cuda:{accelerator.local_process_index}")
+-            self.device_map = f"cuda:{accelerator.local_process_index}"
++            self._device = torch.device(f"{device_type}:{accelerator.local_process_index}")
++            self.device_map = str(self._device)
+         elif accelerator.num_processes == 1 and device_map == "auto":
++            if device_type != "cuda":
++                raise ValueError(
++                    f"InternVL2 device_map=auto is only supported for CUDA, got {requested_device}. "
++                    "Use the default single-device mapping on NPU."
++                )
+             self._device = torch.device(device)
+             device_map = split_model(pretrained.split("/")[-1], num_layers=num_layers)
+             self.device_map = device_map
+         else:
+-            self._device = torch.device(f"cuda:{accelerator.local_process_index}")
+-            self.device_map = f"cuda:{accelerator.local_process_index}"
++            index = requested_device.index if requested_device.index is not None else accelerator.local_process_index
++            self._device = torch.device(f"{device_type}:{index}")
++            self.device_map = str(self._device)
+ 
+         self._model = AutoModel.from_pretrained(
+             self.path,
+@@ -223,6 +298,7 @@ class InternVL2(lmms):
+             trust_remote_code=True,
+             device_map=self.device_map,
+         ).eval()
++        _ensure_internlm2_generation_compat(self._model)
+         self._tokenizer = AutoTokenizer.from_pretrained(self.path, trust_remote_code=True, device_map=self.device_map)
+ 
+         if accelerator.num_processes > 1:
+diff --git a/lmms_eval/models/simple/qwen2_5_vl.py b/lmms_eval/models/simple/qwen2_5_vl.py
+index 1285a3bb..4990873a 100644
+--- a/lmms_eval/models/simple/qwen2_5_vl.py
++++ b/lmms_eval/models/simple/qwen2_5_vl.py
+@@ -21,6 +21,11 @@ from lmms_eval.api.registry import register_model
+ from lmms_eval.imports import optional_import
+ from lmms_eval.models.model_utils.media_encoder import encode_image_to_data_url
+ 
++try:  # Importing registers the Ascend NPU backend when available.
++    import torch_npu  # type: ignore  # noqa: F401
++except Exception:  # pragma: no cover - optional runtime dependency.
++    torch_npu = None
++
+ process_vision_info, _has_qwen_vl = optional_import("qwen_vl_utils", "process_vision_info")
+ if not _has_qwen_vl:
+     eval_logger.warning("Failed to import qwen_vl_utils; Please install it via `pip install qwen-vl-utils`")
+@@ -52,6 +57,10 @@ class Qwen2_5_VL(lmms):
+     ) -> None:
+         super().__init__()
+         # Do not use kwargs for now
++        # QIG may pass device-specific model args through lmms-eval. They are
++        # consumed here so the upstream adapter still rejects unknown kwargs.
++        self._qig_torch_dtype = kwargs.pop("torch_dtype", None)
++        self._qig_attn_implementation = kwargs.pop("attn_implementation", None)
+         assert kwargs == {}, f"Unexpected kwargs: {kwargs}"
+ 
+         # Validate attention implementation
+@@ -66,19 +75,27 @@ class Qwen2_5_VL(lmms):
+             self.device_map = f"cuda:{accelerator.local_process_index}"
+         else:
+             self._device = torch.device(device)
+-            self.device_map = device_map if device_map else device
++            if self._device.type == "npu":
++                # Avoid device_map="auto": Accelerate may route it through CUDA
++                # even in torch+torch_npu CPU builds.
++                self.device_map = None
++            else:
++                self.device_map = device_map if device_map else device
+ 
+         # Prepare model loading arguments
+         model_kwargs = {
+-            "torch_dtype": "bfloat16",
+-            "device_map": self.device_map,
++            "torch_dtype": torch.float16 if self._device.type == "npu" else "bfloat16",
+         }
++        if self.device_map is not None:
++            model_kwargs["device_map"] = self.device_map
+ 
+         # Add attention implementation if specified
+         if attn_implementation is not None:
+             model_kwargs["attn_implementation"] = attn_implementation
+ 
+         self._model = Qwen2_5_VLForConditionalGeneration.from_pretrained(pretrained, **model_kwargs).eval()
++        if self._device.type == "npu":
++            self._model = self._model.to(self._device)
+         self.max_pixels = max_pixels
+         self.min_pixels = min_pixels
+         self.max_num_frames = max_num_frames
+diff --git a/lmms_eval/models/simple/qwen2_vl.py b/lmms_eval/models/simple/qwen2_vl.py
+index ebcc172c..1acb567f 100755
+--- a/lmms_eval/models/simple/qwen2_vl.py
++++ b/lmms_eval/models/simple/qwen2_vl.py
+@@ -18,6 +18,11 @@ from lmms_eval.api.registry import register_model
+ from lmms_eval.imports import optional_import
+ from lmms_eval.models.model_utils.media_encoder import encode_image_to_data_url
+ 
++try:  # Importing registers the Ascend NPU backend when available.
++    import torch_npu  # type: ignore  # noqa: F401
++except Exception:  # pragma: no cover - optional runtime dependency.
++    torch_npu = None
++
+ process_vision_info, _has_qwen_vl = optional_import("qwen_vl_utils", "process_vision_info")
+ if not _has_qwen_vl:
+     eval_logger.warning("Failed to import qwen_vl_utils; Please install it via `pip install qwen-vl-utils`")
+@@ -49,6 +54,11 @@ class Qwen2_VL(lmms):
+     ) -> None:
+         super().__init__()
+         # Do not use kwargs for now
++        # QIG compatibility:
++        # QIG main.py may pass torch_dtype to lmms-eval model constructors.
++        # The upstream simple Qwen2-VL adapter does not consume it, so ignore it here.
++        self._qig_torch_dtype = kwargs.pop("torch_dtype", None)
++        self._qig_attn_implementation = kwargs.pop("attn_implementation", None)
+         assert kwargs == {}, f"Unexpected kwargs: {kwargs}"
+ 
+         accelerator = Accelerator()
+@@ -58,18 +68,25 @@ class Qwen2_VL(lmms):
+         # Simplified logic for single process
+         else:  # accelerator.num_processes == 1
+             self._device = torch.device(device)
+-            # Respect device_map if provided and not empty, otherwise use the determined device string
+-            self.device_map = device_map if device_map else device
+-
++            if self._device.type == "npu":
++                # Transformers/Accelerate still route some device_map strings through CUDA.
++                # Load on CPU first, then move explicitly to Ascend NPU.
++                self.device_map = None
++            else:
++                # Respect device_map if provided and not empty, otherwise use the determined device string
++                self.device_map = device_map if device_map else device
++
++        model_kwargs = {
++            "torch_dtype": torch.float16 if self._device.type == "npu" else "auto",
++        }
++        if self.device_map is not None:
++            model_kwargs["device_map"] = self.device_map
+         if use_flash_attention_2:
+-            self._model = Qwen2VLForConditionalGeneration.from_pretrained(
+-                pretrained,
+-                torch_dtype="auto",
+-                device_map=self.device_map,
+-                attn_implementation="flash_attention_2",
+-            ).eval()
+-        else:
+-            self._model = Qwen2VLForConditionalGeneration.from_pretrained(pretrained, torch_dtype="auto", device_map=self.device_map).eval()
++            model_kwargs["attn_implementation"] = "flash_attention_2"
++
++        self._model = Qwen2VLForConditionalGeneration.from_pretrained(pretrained, **model_kwargs).eval()
++        if self._device.type == "npu":
++            self._model = self._model.to(self._device)
+         self.processor = AutoProcessor.from_pretrained(pretrained, max_pixels=max_pixels, min_pixels=min_pixels)
+         self.max_pixels = max_pixels
+         self.min_pixels = min_pixels
+diff --git a/lmms_eval/models/simple/qwen3_vl.py b/lmms_eval/models/simple/qwen3_vl.py
+index 86c9aa36..7b7b8568 100644
+--- a/lmms_eval/models/simple/qwen3_vl.py
++++ b/lmms_eval/models/simple/qwen3_vl.py
+@@ -88,6 +88,8 @@ class Qwen3_VL(lmms):
+         **kwargs,
+     ) -> None:
+         super().__init__()
++        self._qig_torch_dtype = kwargs.pop("torch_dtype", None)
++        self._qig_attn_implementation = kwargs.pop("attn_implementation", None)
+         assert kwargs == {}, f"Unexpected kwargs: {kwargs}"
+ 
+         valid_attn_implementations = [None, "flash_attention_2", "sdpa", "eager"]
+@@ -101,20 +103,26 @@ class Qwen3_VL(lmms):
+             self.device_map = f"cuda:{accelerator.local_process_index}"
+         else:
+             self._device = torch.device(device)
+-            self.device_map = device_map if device_map else device
++            if self._device.type == "npu":
++                self.device_map = None
++            else:
++                self.device_map = device_map if device_map else device
+ 
+         # Auto-detect model variant and load the appropriate HF class
+         is_moe = bool(re.search(r"A\d+B", pretrained))
+         model_cls, dtype_key = _resolve_model_class(pretrained, is_moe)
+ 
+         model_kwargs = {
+-            dtype_key: "bfloat16",
+-            "device_map": self.device_map,
++            dtype_key: torch.float16 if self._device.type == "npu" else "bfloat16",
+         }
++        if self.device_map is not None:
++            model_kwargs["device_map"] = self.device_map
+         if attn_implementation is not None:
+             model_kwargs["attn_implementation"] = attn_implementation
+ 
+         self._model = model_cls.from_pretrained(pretrained, **model_kwargs).eval()
++        if self._device.type == "npu":
++            self._model = self._model.to(self._device)
+         self.min_pixels = min_pixels
+         self.max_pixels = max_pixels
+         self.total_pixels = total_pixels

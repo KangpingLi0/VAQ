@@ -12,6 +12,8 @@ This repository is the official implementation of CVPR 2026:
 
 **TL;DR: We introduce a fine-grained post-training quantization method for large vision-language models (LVLMs), which leverages quantization-aware integrated gradients (QIG) to estimate parameter importance and guide quantization.**
 
+> Ascend users: see [README_ASCEND_910B.md](README_ASCEND_910B.md) for the multi-machine Ascend 910B 32G reproduction guide.
+
 ## News
 
 - **[2026.04.03]** We release the official code and evaluation pipeline.
