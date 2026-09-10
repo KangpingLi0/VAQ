@@ -1,5 +1,7 @@
 import gc
 import copy
+import json
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,9 +14,11 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm  # Used in app
 
 from qmllm.utils.search import get_op_by_name, get_op_name, set_op_by_name
 from qmllm.quantization.quant_funcs import pseudo_quantize_tensor
+from qmllm.quantization.qlinear import WALinear
+from qmllm.methods.lat_awq.quantize.loss import token_weighted_mse_in_batches
+from qmllm.methods.lat_awq.quantize.saliency import EPS, get_act_scale
 from qmllm.utils.device import (
     empty_cache,
-    finite_act_scale_in_batches,
     get_act_scale_in_batches,
     get_scale_search_batch_size,
     move_to_device,
@@ -24,12 +28,6 @@ from qmllm.utils.device import (
 )
 
 __all__ = ["auto_scale_block", "apply_scale"]
-
-
-@torch.no_grad()
-def get_act_scale(x: torch.Tensor):
-    """Compute per-channel activation scale: [B, T, C] -> [C]."""
-    return x.abs().view(-1, x.shape[-1]).mean(0)
 
 
 @torch.no_grad()
@@ -98,20 +96,28 @@ def auto_scale_block(
     module,
     module_kwargs,
     w_bit,
+    a_bit,
     q_config,
     input_feat,
     ans_mask,
     vis_mask,
     reweight_ratio_dict,
     loss_mode="mae",
+    layer_idx=0,
+    token_aware_saliency=False,
+    token_weighted_loss=False,
+    saliency_mix_lambda=1.0,
+    wa_quant=False,
+    lat_debug=False,
+    debug_path=None,
 ):
     """
-    Run adaptive scale search for a single Transformer block under weight-only quantization.
-    By default, the loss is reweighted by IGQ (Integrated Gradients for Quantization) token-importance.
-    External function signature is kept unchanged.
+    Run adaptive scale search for a Transformer block under weight-only or
+    weight-activation fake quantization. Token-aware channel saliency and the
+    token-weighted reconstruction objective are shared by both paths.
     """
 
-    # === Weight-only quantization function ===
+    # === Quantization helpers ===
     if w_bit is not None:
 
         def w_quantize_func(p):
@@ -121,6 +127,28 @@ def auto_scale_block(
 
         def w_quantize_func(p):
             return p
+
+    def _wa_quantize_linear(linear):
+        return WALinear.from_float(
+            linear,
+            weight_quant="per_channel",
+            act_quant="per_token",
+            w_bit=w_bit,
+            a_bit=a_bit,
+        )
+
+    def _wa_quantize_module(module_to_quantize):
+        """Return a copy-compatible module whose Linear layers perform W/A fake quantization."""
+        if isinstance(module_to_quantize, nn.Linear):
+            return _wa_quantize_linear(module_to_quantize)
+        linears = [
+            (name, child)
+            for name, child in module_to_quantize.named_modules()
+            if name and isinstance(child, nn.Linear)
+        ]
+        for name, child in linears:
+            set_op_by_name(module_to_quantize, name, _wa_quantize_linear(child))
+        return module_to_quantize
 
     if "use_cache" in module_kwargs:
         module_kwargs.pop("use_cache")
@@ -163,11 +191,14 @@ def auto_scale_block(
             owns_block_q = block_q is None
             if owns_block_q:
                 block_q = copy.deepcopy(block).to(device)
-                for m in block_q.modules():
-                    if isinstance(m, nn.Linear):
-                        m.weight.data = pseudo_quantize_tensor(
-                            m.weight.data, n_bits=w_bit, **q_config
-                        ).detach()
+                if wa_quant:
+                    block_q = _wa_quantize_module(block_q)
+                else:
+                    for m in block_q.modules():
+                        if isinstance(m, nn.Linear):
+                            m.weight.data = pseudo_quantize_tensor(
+                                m.weight.data, n_bits=w_bit, **q_config
+                            ).detach()
 
             was_training_fp = block.training
             was_training_q = block_q.training
@@ -253,6 +284,74 @@ def auto_scale_block(
             empty_cache(device)
             return token_w.detach(), iqr_vis
 
+        def _padding_mask(x):
+            """Return a [B,T] non-padding mask when the model exposes one."""
+            attention_mask = (kwargs or {}).get("attention_mask")
+            if not torch.is_tensor(attention_mask):
+                return torch.ones(x.shape[:2], device=x.device, dtype=torch.bool)
+
+            attention_mask = attention_mask.to(x.device)
+            if attention_mask.ndim == 2 and tuple(attention_mask.shape) == tuple(x.shape[:2]):
+                return attention_mask > 0
+            if attention_mask.ndim == 4 and attention_mask.shape[0] == x.shape[0]:
+                diagonal = attention_mask[:, 0].diagonal(dim1=-2, dim2=-1)
+                if tuple(diagonal.shape) == tuple(x.shape[:2]):
+                    return torch.isfinite(diagonal) & (diagonal > -1e4)
+            return torch.ones(x.shape[:2], device=x.device, dtype=torch.bool)
+
+        def _valid_mask(x, ans_mask, vis_mask):
+            masks = []
+            for mask in (ans_mask, vis_mask):
+                if mask is None:
+                    continue
+                mask = mask.to(device=x.device)
+                if mask.ndim != 2 or tuple(mask.shape) != tuple(x.shape[:2]):
+                    raise ValueError(
+                        f"token mask must be [B,T]={tuple(x.shape[:2])}, got {tuple(mask.shape)}"
+                    )
+                masks.append(mask > 0)
+            if masks:
+                valid = masks[0]
+                for mask in masks[1:]:
+                    valid = valid | mask
+            else:
+                valid = torch.ones(x.shape[:2], device=x.device, dtype=torch.bool)
+            return valid & _padding_mask(x)
+
+        def _sanitize_token_weights(token_w, x, ans_mask, vis_mask):
+            if token_w.ndim != 2 or tuple(token_w.shape) != tuple(x.shape[:2]):
+                raise ValueError(
+                    f"token_w must be [B,T]={tuple(x.shape[:2])}, got {tuple(token_w.shape)}"
+                )
+            valid = _valid_mask(x, ans_mask, vis_mask)
+            token_w = token_w.to(device=x.device, dtype=torch.float32)
+            token_w = torch.where(torch.isfinite(token_w), token_w, torch.zeros_like(token_w))
+            token_w = token_w.clamp_min(0) * valid.float()
+            row_sum = token_w.sum(dim=1, keepdim=True)
+            normalized = token_w / row_sum.clamp_min(EPS)
+
+            # Fall back independently per row. Prefer the caption/vision valid set;
+            # if that set is empty, use non-padding tokens, and only use every token
+            # when the attention mask itself marks no valid positions.
+            fallback_mask = valid
+            fallback_count = fallback_mask.sum(dim=1, keepdim=True)
+            padding_mask = _padding_mask(x)
+            fallback_mask = torch.where(
+                fallback_count > 0, fallback_mask, padding_mask
+            )
+            fallback_count = fallback_mask.sum(dim=1, keepdim=True)
+            fallback_mask = torch.where(
+                fallback_count > 0,
+                fallback_mask,
+                torch.ones_like(fallback_mask),
+            )
+            fallback = fallback_mask.float()
+            fallback = fallback / fallback.sum(dim=1, keepdim=True).clamp_min(EPS)
+            token_w = torch.where(row_sum > EPS, normalized, fallback)
+            if not torch.isfinite(token_w).all():
+                raise FloatingPointError("LAT-AWQ could not construct finite token weights")
+            return token_w
+
         def _uniform_weights(x, ans_mask, vis_mask):
             """
             Uniformly assign weights over tokens where ans_mask==1 or vis_mask==1;
@@ -262,27 +361,25 @@ def auto_scale_block(
             dtype = torch.float32
             B, T, _ = x.shape
 
-            # Ensure masks are on the same device
-            ans_mask = ans_mask.to(device=device, dtype=dtype)
-            vis_mask = vis_mask.to(device=device, dtype=dtype)
-
-            # A token is valid if either mask is 1
-            valid_mask = ((ans_mask > 0) | (vis_mask > 0)).float()
+            valid_mask = _valid_mask(x, ans_mask, vis_mask).to(dtype)
 
             # Uniform distribution over valid tokens (normalized per batch)
             valid_count = valid_mask.sum(dim=1, keepdim=True).clamp_min(1e-8)
             token_w = valid_mask / valid_count
-            return token_w
+            return _sanitize_token_weights(token_w, x, ans_mask, vis_mask)
 
         def _compute_token_importance_weights_batched(block, x, kwargs):
             total = x.shape[0]
             chunks = []
             block_q = copy.deepcopy(block).to(device)
-            for m in block_q.modules():
-                if isinstance(m, nn.Linear):
-                    m.weight.data = pseudo_quantize_tensor(
-                        m.weight.data, n_bits=w_bit, **q_config
-                    ).detach()
+            if wa_quant:
+                block_q = _wa_quantize_module(block_q)
+            else:
+                for m in block_q.modules():
+                    if isinstance(m, nn.Linear):
+                        m.weight.data = pseudo_quantize_tensor(
+                            m.weight.data, n_bits=w_bit, **q_config
+                        ).detach()
             for start in range(0, total, batch_size):
                 end = min(start + batch_size, total)
                 x_mb = x[start:end].to(device)
@@ -293,29 +390,22 @@ def auto_scale_block(
                 empty_cache(device)
             del block_q
             empty_cache(device)
-            return torch.cat(chunks, dim=0), None
+            token_w = torch.cat(chunks, dim=0)
+            return _sanitize_token_weights(token_w, x, ans_mask, vis_mask).cpu(), None
 
-        # Use a function attribute as a layer counter (keeps original intent)
-        if not hasattr(auto_scale_block, "_layer_idx"):
-            auto_scale_block._layer_idx = 0
-        layer_idx = auto_scale_block._layer_idx
-
-        try:
-            # Original behavior: use IGQ after the 10th call, otherwise uniform weights
-            if layer_idx >= 9:
-                token_w, _ = _compute_token_importance_weights_batched(block, x, kwargs)
-            else:
-                token_w = _uniform_weights(x, ans_mask, vis_mask)
-        finally:
-            auto_scale_block._layer_idx += 1
-
-        # NOTE: The original snippet increments _layer_idx twice (likely a bug).
-        # Kept as-is to avoid changing runtime behavior in case code relies on it.
-        auto_scale_block._layer_idx += 1
+        use_token_importance = bool(token_aware_saliency or token_weighted_loss)
+        if use_token_importance:
+            token_w, _ = _compute_token_importance_weights_batched(block, x, kwargs)
+        else:
+            token_w = None
 
         # ---- Grid search with token-weighted loss ----
-        x, x_max = finite_act_scale_in_batches(
-            x, batch_size=batch_size, device=device
+        # Compute both statistics in FP32. The activation itself is never reweighted
+        # before a forward pass.
+        a_global, a_imp, x_max = get_act_scale(
+            x,
+            token_w=token_w if token_aware_saliency else None,
+            mix_lambda=saliency_mix_lambda if token_aware_saliency else 0.0,
         )
         best_error = float("inf")
         best_ratio = -1
@@ -325,34 +415,83 @@ def auto_scale_block(
 
         # Save/restore parameters for each grid candidate
         baseline_block = copy.deepcopy(block).to(device).eval()
-        org_sd = {k: v.detach().cpu() for k, v in block.state_dict().items()}
+        org_sd = {k: v.detach().cpu().clone() for k, v in block.state_dict().items()}
+
+        linear_names = []
+        if wa_quant and not isinstance(block, nn.Linear):
+            linear_names = [get_op_name(block, fc) for fc in linears2scale]
+            if any(not name for name in linear_names):
+                raise ValueError("Could not resolve a target Linear name for W/A scale search")
 
         for ratio in range(n_grid):
             ratio = ratio / n_grid
-            scales = normalized_power_scales(x_max, ratio)
-
+            scales = normalized_power_scales(x_max.to(device=device), ratio)
             for fc in linears2scale:
-                weight_scales = scales.to(
-                    device=fc.weight.device, dtype=fc.weight.dtype
-                ).view(1, -1)
-                fc.weight.mul_(weight_scales)
-                fc.weight.data = w_quantize_func(fc.weight.data) / weight_scales
+                if scales.numel() != fc.in_features:
+                    raise ValueError(
+                        f"scale channels ({scales.numel()}) != in_features "
+                        f"({fc.in_features}) for {get_op_name(module, fc)}"
+                    )
+            if not torch.isfinite(scales).all():
+                raise FloatingPointError("LAT-AWQ produced non-finite scales")
 
-            loss_val = reconstruction_loss_in_batches(
-                baseline_block,
-                baseline_x=x,
-                kwargs=kwargs,
-                test_module=block,
-                token_w=token_w,
-                loss_mode=loss_mode,
-                batch_size=batch_size,
-                device=device,
-            )
+            test_module = block
+            if wa_quant:
+                if isinstance(block, nn.Linear):
+                    fc = linears2scale[0]
+                    fc_scales = scales.to(device=fc.weight.device, dtype=fc.weight.dtype).view(1, -1)
+                    fc.weight.mul_(fc_scales)
+                    test_module = _wa_quantize_linear(fc)
+                else:
+                    for fc, fc_name in zip(linears2scale, linear_names):
+                        fc_scales = scales.to(device=fc.weight.device, dtype=fc.weight.dtype).view(1, -1)
+                        fc.weight.mul_(fc_scales)
+                        set_op_by_name(block, fc_name, _wa_quantize_linear(fc))
+            else:
+                for fc in linears2scale:
+                    fc_scales = scales.to(device=fc.weight.device, dtype=fc.weight.dtype).view(1, -1)
+                    fc.weight.mul_(fc_scales)
+                    fc.weight.data = w_quantize_func(fc.weight.data) / fc_scales
+
+            if token_weighted_loss and wa_quant:
+                loss_val = reconstruction_loss_in_batches(
+                    baseline_block,
+                    baseline_x=x,
+                    kwargs=kwargs,
+                    test_module=test_module,
+                    input_scales=scales,
+                    token_w=token_w,
+                    loss_mode="mse",
+                    batch_size=batch_size,
+                    device=device,
+                )
+            elif token_weighted_loss:
+                loss_val = token_weighted_mse_in_batches(
+                    baseline_block,
+                    baseline_x=x,
+                    kwargs=kwargs,
+                    test_module=test_module,
+                    token_w=token_w,
+                    batch_size=batch_size,
+                    device=device,
+                )
+            else:
+                loss_val = reconstruction_loss_in_batches(
+                    baseline_block,
+                    baseline_x=x,
+                    kwargs=kwargs,
+                    test_module=test_module,
+                    input_scales=scales if wa_quant else None,
+                    # Match the repository AWQ objective: it passes vision_mask
+                    # through its ans_mask argument.
+                    ans_mask=vis_mask,
+                    loss_mode="mse",
+                    batch_size=batch_size,
+                    device=device,
+                )
 
             if not torch.isfinite(torch.tensor(loss_val)):
-                block.load_state_dict(org_sd, strict=True)
-                history.append((ratio, float("inf")))
-                continue
+                raise FloatingPointError(f"non-finite scale-search loss at alpha={ratio}")
             history.append((ratio, loss_val))
 
             if loss_val < best_error:
@@ -360,12 +499,59 @@ def auto_scale_block(
                 best_ratio = ratio
                 best_scales = scales
 
-            # Restore parameters
+            # Restore modules first, then their original parameters.
+            if wa_quant and not isinstance(block, nn.Linear):
+                for fc, fc_name in zip(linears2scale, linear_names):
+                    set_op_by_name(block, fc_name, fc)
             block.load_state_dict(org_sd, strict=True)
+            if wa_quant and isinstance(block, nn.Linear):
+                del test_module
 
         if best_ratio == -1 or best_scales is None:
             print("Scale search history:", history)
             raise RuntimeError("Failed to find best ratio.")
+
+        group_name = "+".join(get_op_name(module, fc) for fc in linears2scale)
+        global_rank = torch.argsort(torch.argsort(a_global))
+        imp_rank = torch.argsort(torch.argsort(a_imp))
+        global_rank = global_rank.float() - global_rank.float().mean()
+        imp_rank = imp_rank.float() - imp_rank.float().mean()
+        rank_cosine = F.cosine_similarity(global_rank, imp_rank, dim=0)
+        relative_l1 = (a_global - a_imp).abs().mean() / a_global.abs().mean().clamp_min(EPS)
+        stats = {
+            "layer_idx": int(layer_idx),
+            "group": group_name,
+            "x_shape": list(x.shape),
+            "token_w_shape": list(token_w.shape) if token_w is not None else None,
+            "token_w_min": float(token_w.min()) if token_w is not None else None,
+            "token_w_max": float(token_w.max()) if token_w is not None else None,
+            "token_w_mean": float(token_w.mean()) if token_w is not None else None,
+            "token_w_std": float(token_w.std(unbiased=False)) if token_w is not None else None,
+            "token_w_l2": float(token_w.float().pow(2).sum().sqrt()) if token_w is not None else None,
+            "token_w_argmax": token_w.argmax(dim=1).tolist() if token_w is not None else None,
+            "a_global_min": float(a_global.min()),
+            "a_global_max": float(a_global.max()),
+            "a_global_mean": float(a_global.mean()),
+            "a_imp_min": float(a_imp.min()),
+            "a_imp_max": float(a_imp.max()),
+            "a_imp_mean": float(a_imp.mean()),
+            "saliency_cosine": float(F.cosine_similarity(a_global, a_imp, dim=0)),
+            "saliency_rank_cosine": float(rank_cosine),
+            "saliency_relative_l1": float(relative_l1),
+            "selected_alpha": float(best_ratio),
+            "best_loss": float(best_error),
+            "scale_min": float(best_scales.min()),
+            "scale_max": float(best_scales.max()),
+            "token_aware_saliency": bool(token_aware_saliency),
+            "token_weighted_loss": bool(token_weighted_loss),
+            "saliency_mix_lambda": float(saliency_mix_lambda),
+        }
+        if lat_debug:
+            print("[LAT-AWQ] " + json.dumps(stats, sort_keys=True), flush=True)
+        if debug_path:
+            os.makedirs(os.path.dirname(debug_path) or ".", exist_ok=True)
+            with open(debug_path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(stats, sort_keys=True) + "\n")
 
         del baseline_block
         return best_scales.view(-1).detach()
@@ -736,7 +922,7 @@ def apply_scale(module, scales_list, input_feat_dict=None):
             scale_ln_fcs(prev_op, layers, scales)
         elif isinstance(prev_op, (nn.GELU, BloomGelu, GELUActivation)):
             # Lazy import to avoid circular dependencies
-            from qmllm.methods.qig.quantize.qmodule import ScaledActivation  # noqa: WPS433
+            from qmllm.methods.lat_awq.quantize.qmodule import ScaledActivation  # noqa: WPS433
 
             new_module = ScaledActivation(prev_op, scales)
             set_op_by_name(module, prev_op_name, new_module)

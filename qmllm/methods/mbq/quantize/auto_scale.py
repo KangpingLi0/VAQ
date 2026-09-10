@@ -13,9 +13,11 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
 from .qmodule import ScaledActivation
 from qmllm.utils.search import get_op_by_name, get_op_name, set_op_by_name
 from qmllm.utils.device import (
+    finite_act_scale_in_batches,
     get_act_scale_in_batches,
     get_scale_search_batch_size,
     module_device,
+    normalized_power_scales,
     reconstruction_loss_in_batches,
 )
 from qmllm.quantization.quant_funcs import pseudo_quantize_tensor
@@ -120,7 +122,9 @@ def auto_scale_block(module, module_kwargs, w_bit, q_config, input_feat, ans_mas
         device = next(block.parameters()).device
         kwargs = kwargs or {}
         batch_size = get_scale_search_batch_size(x.shape[0])
-        x_max = get_act_scale_in_batches(x, batch_size=batch_size, device=device)
+        x, x_max = finite_act_scale_in_batches(
+            x, batch_size=batch_size, device=device
+        )
 
         best_error = float("inf")
         best_ratio = -1
@@ -133,11 +137,13 @@ def auto_scale_block(module, module_kwargs, w_bit, q_config, input_feat, ans_mas
         org_sd = {k: v.cpu() for k, v in block.state_dict().items()}
         for ratio in range(n_grid):
             ratio = ratio * 1 / n_grid
-            scales = x_max.pow(ratio).clamp(min=1e-4).view(-1)
-            scales = scales / (scales.max() * scales.min()).sqrt()
+            scales = normalized_power_scales(x_max, ratio)
             for fc in linears2scale:
-                fc.weight.mul_(scales.view(1, -1).to(fc.weight.device))
-                fc.weight.data = w_quantize_func(fc.weight.data) / (scales.view(1, -1))
+                weight_scales = scales.to(
+                    device=fc.weight.device, dtype=fc.weight.dtype
+                ).view(1, -1)
+                fc.weight.mul_(weight_scales)
+                fc.weight.data = w_quantize_func(fc.weight.data) / weight_scales
             loss = reconstruction_loss_in_batches(
                 baseline_block,
                 baseline_x=x,
@@ -151,6 +157,10 @@ def auto_scale_block(module, module_kwargs, w_bit, q_config, input_feat, ans_mas
                 device=device,
             )
 
+            if not torch.isfinite(torch.tensor(loss)):
+                block.load_state_dict(org_sd)
+                history.append(float("inf"))
+                continue
             history.append(loss)
             is_best = loss < best_error
             if is_best:

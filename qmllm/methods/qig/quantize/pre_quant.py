@@ -25,7 +25,12 @@ from qmllm.methods.qig.quantize.auto_scale import auto_scale_block, apply_scale
 from qmllm.quantization.qlinear import WALinear
 from qmllm.quantization.quant_funcs import pseudo_quantize_tensor
 from utils.device import get_device
-from qmllm.utils.device import empty_cache, forward_module_in_batches, move_to_device
+from qmllm.utils.device import (
+    empty_cache,
+    forward_module_in_batches,
+    get_scale_search_batch_size,
+    move_to_device,
+)
 from .quantizer import get_module_by_name_suffix
 
 
@@ -390,6 +395,14 @@ def run_qig(
         layer = layer.to(device)
         named_linears = get_named_linears(layer)
 
+        # Keep the input of the current decoder layer.  ``inps`` is replaced
+        # below by this layer's output, but W/A scale search still needs the
+        # corresponding block input.  Previously the non-distortion W/A path
+        # unconditionally referenced ``inps_distort``, which is only created
+        # when --distort is enabled and therefore crashed with
+        # UnboundLocalError for ordinary W4A8 QIG runs.
+        layer_input = inps
+
         # firstly, get input features of all linear layers
         def cache_input_hook(m, x, y, name, feat_dict):
             x = x[0]
@@ -407,7 +420,13 @@ def run_qig(
         # get output as next layer's input
 
         layer_device = next(layer.parameters()).device
-        inps = forward_module_in_batches(layer, inps, layer_kwargs, batch_size=1, device=layer_device)
+        inps = forward_module_in_batches(
+            layer,
+            inps,
+            layer_kwargs,
+            batch_size=get_scale_search_batch_size(inps.shape[0]),
+            device=layer_device,
+        )
         for h in handles:
             h.remove()
         # now solve for scaling
@@ -452,7 +471,7 @@ def run_qig(
                     ans_mask=ans_mask,
                     vis_mask=vis_mask,
                     reweight_ratio_dict=scale_reweight_ratio_dict,
-                    q_input=inps_distort,
+                    q_input=inps_distort if distort else layer_input,
                     loss_mode=loss_mode
                 )
             else:
@@ -485,7 +504,13 @@ def run_qig(
                         empty_cache(device)
                     
                     layer_q_device = next(layer_q.parameters()).device
-                    inps_distort = forward_module_in_batches(layer_q, inps_distort, layer_kwargs, batch_size=1, device=layer_q_device)
+                    inps_distort = forward_module_in_batches(
+                        layer_q,
+                        inps_distort,
+                        layer_kwargs,
+                        batch_size=get_scale_search_batch_size(inps_distort.shape[0]),
+                        device=layer_q_device,
+                    )
                     del layer_q
 
             # append prefix to make names global
@@ -498,7 +523,7 @@ def run_qig(
 
         layer = layer.cpu()
         # Haotian: check activation replacement
-        del input_feat
+        del input_feat, layer_input
         gc.collect()
         empty_cache(device)
 

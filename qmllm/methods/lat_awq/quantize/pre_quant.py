@@ -14,123 +14,44 @@ from transformers.models.opt.modeling_opt import OPTForCausalLM
 from transformers.models.llama.modeling_llama import LlamaForCausalLM
 
 from qmllm.utils.search import append_str_prefix, get_op_name
+from qmllm.utils.hf_compat import (
+    get_qwen_vl_layers,
+    move_qwen_vl_embeddings,
+    move_qwen_vl_rotary,
+)
+
+from qmllm.methods.lat_awq.quantize.auto_scale_wa_distort import auto_scale_block_wa_distort
+from qmllm.methods.lat_awq.quantize.auto_scale import auto_scale_block, apply_scale
+from qmllm.quantization.qlinear import WALinear
+from qmllm.quantization.quant_funcs import pseudo_quantize_tensor
+from utils.device import get_device
 from qmllm.utils.device import (
     empty_cache,
     forward_module_in_batches,
     get_scale_search_batch_size,
-    module_device,
     move_to_device,
 )
-from qmllm.utils.hf_compat import get_qwen_vl_layers, move_qwen_vl_embeddings
-
-from qmllm.methods.mbq.quantize.auto_scale_wa_distort import auto_scale_block_wa_distort
-from qmllm.methods.mbq.quantize.auto_scale_wa import auto_scale_block_wa
-from qmllm.methods.mbq.quantize.auto_scale_distort import auto_scale_block_distort
-from qmllm.methods.mbq.quantize.auto_scale import auto_scale_block, apply_scale
-from qmllm.quantization.qlinear import WALinear
-from qmllm.quantization.quant_funcs import pseudo_quantize_tensor
 from .quantizer import get_module_by_name_suffix
 
 
-__all__ = ["run_mbq"]
+__all__ = ["run_lat_awq"]
 
 
-# class GradCacheHook:
-#     def __init__(self, vis_masks, cap_masks):
-#         if vis_masks is None or cap_masks is None:
-#             raise ValueError
-#         self.hooks = []
-#         self.vis_masks = vis_masks.cpu()
-#         self.cap_masks = cap_masks.cpu()
-#         self.steps = {}
-#         self.grad_dict = {}
-
-
-#     def cache_grad_hook(self, module, inp, out, name):
-#         # initialize step counter, we use step counter to find the right mask for the grad
-#         if name not in self.steps:
-#             self.steps[name] = 0
-
-#         if name not in self.grad_dict:
-#             self.grad_dict[name] = {"vis_grad": [], "cap_grad": []}
-
-#         output_grad = out[0].float()
-#         step = self.steps[name]
-
-#         B, N, C = output_grad.shape
-
-#         for batch_idx in range(B):
-#             vis_mask = self.vis_masks[step]
-#             cap_mask = self.cap_masks[step]
-
-#             vis_grad = output_grad[batch_idx][vis_mask]
-#             cap_grad = output_grad[batch_idx][cap_mask]
-
-#             vis_grad_avg = vis_grad.abs().mean()
-#             cap_grad_avg = cap_grad.abs().mean()
-
-#             self.grad_dict[name]["vis_grad"].append(vis_grad_avg.detach().cpu())
-#             self.grad_dict[name]["cap_grad"].append(cap_grad_avg.detach().cpu())
-
-#             step = step + 1
-
-#         self.steps[name] = step
-
-
-#     def register_hooks(self, layers):
-#         for n, m in layers.named_modules():
-#             if isinstance(m, nn.Linear) and any([_ in n for _ in ["wo", "w2", "down_proj", "o_proj", "v_proj", "gate_proj", "up_proj", "w1", "w3"]]):
-#                 # print(f"Registering hook for layer.{n}")
-#                 self.hooks.append(
-#                     m.register_full_backward_hook(
-#                         functools.partial(self.cache_grad_hook, name=f"layers.{n}")
-#                     )
-#                 )
-
-
-#     def remove_hooks(self):
-#         for h in self.hooks:
-#             h.remove()
-#         self.hooks.clear()
-
-
-#     def get_grad_dict(self):
-#         return self.grad_dict
-    
-
-#     def get_avg_grad_dict(self):
-#         avg_grad_dict = {}
-
-#         for name, grad_values in self.grad_dict.items():
-#             mean_vis = torch.mean(torch.stack(grad_values["vis_grad"]))
-#             mean_cap = torch.mean(torch.stack(grad_values["cap_grad"]))
-
-#             avg_grad_dict[name] = {
-#                 "vis_avg_grad": mean_vis.item(),
-#                 "cap_avg_grad": mean_cap.item()
-#             }
-
-#         return avg_grad_dict
-    
 class GradCacheHook:
     def __init__(self, vis_masks, cap_masks):
         if vis_masks is None or cap_masks is None:
             raise ValueError
-
         self.hooks = []
-        self.vis_masks_cpu = vis_masks.to(torch.bool).contiguous()   # [S, N]
-        self.cap_masks_cpu = cap_masks.to(torch.bool).contiguous()   # [S, N]
-
-        self._mask_cache = {}  # device -> (vis_masks_dev, cap_masks_dev)
-
-        self.ptr = {}          # name -> global sample pointer
-        self.sum_vis = {}      # name -> scalar tensor on that module's device
+        self.vis_masks_cpu = vis_masks.to(torch.bool).contiguous()
+        self.cap_masks_cpu = cap_masks.to(torch.bool).contiguous()
+        self._mask_cache = {}
+        self.ptr = {}
+        self.sum_vis = {}
         self.sum_cap = {}
-        self.cnt = {}          # name -> int
+        self.cnt = {}
 
     def _get_masks_on(self, device):
         if device not in self._mask_cache:
-            # 把整块 mask 一次性搬到对应 GPU（只做一次）
             self._mask_cache[device] = (
                 self.vis_masks_cpu.to(device, non_blocking=True),
                 self.cap_masks_cpu.to(device, non_blocking=True),
@@ -138,34 +59,29 @@ class GradCacheHook:
         return self._mask_cache[device]
 
     @torch.no_grad()
-    def cache_grad_hook(self, module, grad_input, grad_output, name):
-        g = grad_output[0]  # [B, N, C]  (你这里假设是三维)
-        if g is None or g.dim() != 3:
+    def cache_grad_hook(self, module, inp, out, name):
+        output_grad = out[0]
+        if output_grad is None or output_grad.dim() != 3:
             return
 
-        device = g.device
+        device = output_grad.device
         vis_masks, cap_masks = self._get_masks_on(device)
+        batch, _, _ = output_grad.shape
+        start = self.ptr.get(name, 0)
+        end = start + batch
+        self.ptr[name] = end
 
-        B, N, C = g.shape
-        s = self.ptr.get(name, 0)
-        e = s + B
-        self.ptr[name] = e
+        vis_mask = vis_masks[start:end]
+        cap_mask = cap_masks[start:end]
+        grad_tok = output_grad.abs().mean(dim=-1).to(torch.float32)
 
-        vis_m = vis_masks[s:e]  # [B, N]
-        cap_m = cap_masks[s:e]  # [B, N]
+        def masked_mean(values, mask):
+            mask = mask.to(values.dtype)
+            denom = mask.sum(dim=1).clamp_min(1.0)
+            return (values * mask).sum(dim=1) / denom
 
-        # 先把 channel 维度压掉：每 token 一个梯度强度
-        # 用 float32 做统计更稳，但只在这一步 cast，成本小
-        grad_tok = g.abs().mean(dim=-1).to(torch.float32)  # [B, N]
-
-        def masked_mean(x, m):
-            m_f = m.to(x.dtype)
-            num = (x * m_f).sum(dim=1)                # [B]
-            den = m_f.sum(dim=1).clamp_min(1.0)       # [B]
-            return num / den
-
-        vis_avg = masked_mean(grad_tok, vis_m)  # [B]
-        cap_avg = masked_mean(grad_tok, cap_m)  # [B]
+        vis_avg = masked_mean(grad_tok, vis_mask)
+        cap_avg = masked_mean(grad_tok, cap_mask)
 
         if name not in self.sum_vis:
             self.sum_vis[name] = torch.zeros((), device=device, dtype=torch.float32)
@@ -174,32 +90,38 @@ class GradCacheHook:
 
         self.sum_vis[name] += vis_avg.sum()
         self.sum_cap[name] += cap_avg.sum()
-        self.cnt[name] += B
+        self.cnt[name] += batch
 
     def register_hooks(self, layers):
-        need = ("wo", "o_proj", "w2", "down_proj")  # 只挂你真正用到的
         for n, m in layers.named_modules():
-            if isinstance(m, nn.Linear) and any(k in n for k in need):
+            if isinstance(m, nn.Linear) and any([_ in n for _ in ["wo", "w2", "down_proj", "o_proj"]]):
+                # print(f"Registering hook for layer.{n}")
                 self.hooks.append(
                     m.register_full_backward_hook(
                         functools.partial(self.cache_grad_hook, name=f"layers.{n}")
                     )
                 )
 
+
     def remove_hooks(self):
         for h in self.hooks:
             h.remove()
         self.hooks.clear()
 
+
+    def get_grad_dict(self):
+        return self.get_avg_grad_dict()
+    
+
     def get_avg_grad_dict(self):
         out = {}
         for name in self.sum_vis:
-            vis = (self.sum_vis[name] / max(self.cnt[name], 1)).detach().cpu().item()
-            cap = (self.sum_cap[name] / max(self.cnt[name], 1)).detach().cpu().item()
-            out[name] = {"vis_avg_grad": vis, "cap_avg_grad": cap}
+            out[name] = {
+                "vis_avg_grad": (self.sum_vis[name] / max(self.cnt[name], 1)).detach().cpu().item(),
+                "cap_avg_grad": (self.sum_cap[name] / max(self.cnt[name], 1)).detach().cpu().item(),
+            }
         return out
-
-
+    
 
 def get_named_linears(module):
     return {name: m for name, m in module.named_modules() if isinstance(m, nn.Linear)}
@@ -274,7 +196,8 @@ def move_embed(model, device):
         model.model.vision_tower.vision_tower.vision_model.embeddings.to(device)
     elif model.__class__.__name__ == "LlavaQwenForCausalLM":
         model.model.embed_tokens = model.model.embed_tokens.to(device)
-        # model.model.rotary_emb = model.model.rotary_emb.to(device)
+        model.model.rotary_emb = model.model.rotary_emb.to(device)
+        model.model.norm = model.model.norm.to(device)
     elif model.__class__.__name__ == "InternLM2ForCausalLM":
         model.model.tok_embeddings = model.model.tok_embeddings.to(device)
     elif model.__class__.__name__ == "InternVLChatModel":
@@ -301,7 +224,7 @@ def process_input(prompt_inputs, prompt_kwargs):
 
 
 @torch.no_grad()
-def run_mbq(
+def run_lat_awq(
     model,
     prompt_inputs,
     prompt_kwargs,
@@ -312,10 +235,17 @@ def run_mbq(
     loss_mode="mae",
     wa_quant=False,
     reweight=False,
-    distort=False
+    distort=False,
+    device=None,
+    token_aware_saliency=False,
+    token_weighted_loss=False,
+    saliency_mix_lambda=1.0,
+    lat_debug=False,
+    debug_path=None,
 ):
-    device = torch.device(getattr(model, "device", module_device(model.model)))
-
+    device = get_device(device or getattr(model, "device", "auto"))
+    if hasattr(model, "set_device"):
+        model.set_device(device)
     if "bigcode" in str(model.model.__class__).lower():
         # otherwise attention_mask will always be on cpu.
         model.transformer.bias = model.transformer.bias.to(device)
@@ -326,7 +256,12 @@ def run_mbq(
     layer_kwargs = {}
 
     layers[0] = layers[0].to(device)
-    move_embed(model.model, device)
+    move_embed(model.model, 'cpu')
+    if model.model.__class__.__name__ in (
+        "Qwen2_5_VLForConditionalGeneration",
+        "Qwen3VLForConditionalGeneration",
+    ):
+        move_qwen_vl_rotary(model.model, device)
 
     # get input and kwargs to layer 0
     # with_kwargs is only supported in PyTorch 2.0
@@ -337,7 +272,6 @@ def run_mbq(
             self.module = module
             if hasattr(module, "attention_type"):
                 self.attention_type = module.attention_type
-
         def forward(self, inp, **kwargs):
             inps.append(inp)
             layer_kwargs.update(kwargs)
@@ -349,8 +283,17 @@ def run_mbq(
     inputs, vision_mask, caption_mask = process_input(prompt_inputs, prompt_kwargs)
     inputs = move_to_device(inputs, device)
 
-    model.to_cuda()
+    # model.to_cuda()
     try:
+        if device.type == "cuda" and torch.cuda.device_count() > 1:
+            model.to_cpu()
+            for k, v in inputs.items():
+                if torch.is_tensor(v):
+                    inputs[k] = v.to('cpu')
+                # if list
+                elif isinstance(v, list):
+                    inputs[k] = [item.to('cpu') if torch.is_tensor(item) else item for item in v]
+            # inputs = {k: v.to('cpu') if torch.is_tensor(v) else v for k, v in inputs.items()}           
         model(**inputs)
     except ValueError: # work with early exit
         pass
@@ -368,44 +311,53 @@ def run_mbq(
     gc.collect()
     empty_cache(device)
 
-    mbq_results = {
+    lat_awq_results = {
         "scale": [],
+        "metadata": {
+            "method": "lat_awq",
+            "w_bit": int(w_bit),
+            "a_bit": int(a_bit),
+            "group_size": int(q_config.get("q_group_size", -1)),
+            "token_aware_saliency": bool(token_aware_saliency),
+            "token_weighted_loss": bool(token_weighted_loss),
+            "saliency_mix_lambda": float(saliency_mix_lambda),
+            "layer_indexing": "explicit_enumerate",
+            "n_samples": int(inps.shape[0]),
+        },
     }
 
-
+    model.to_cpu()
     if reweight:
-        model.to_cuda()
-        
-        # for name, param in model.model.named_parameters():
-        #     print(f"Parameter {name} is on device {param.device}")
-        
+        if hasattr(model, "to_device"):
+            model.to_device(device)
+        else:
+            model.to_cuda()
+
         for p in model.model.parameters():
             p.requires_grad_(False)
         if hasattr(model, "lm_head"):
             for p in model.lm_head.parameters():
                 p.requires_grad_(False)
-
         grad_checkpointing_enabled = False
         if hasattr(model.model, "gradient_checkpointing_enable"):
             model.model.gradient_checkpointing_enable()
             grad_checkpointing_enabled = True
-        
         if hasattr(model.model, "config"):
             model.model.config.use_cache = False
             model.model.config.output_attentions = False
             model.model.config.output_hidden_states = False
-            print("Save gradient...")
-            
+
         # save gradient
         grad_cache = GradCacheHook(vis_masks=vision_mask, cap_masks=caption_mask)        
         grad_cache.register_hooks(layers=layers)
-        
+               
         with torch.enable_grad():
             mini_batch = 1
             total_samples = next(iter(prompt_inputs.values())).shape[0]
             accum_steps = int(total_samples/mini_batch)
             model.model.zero_grad(set_to_none=True)
-            for i in tqdm.tqdm(range(0, total_samples, mini_batch), desc="Running gradient calculation..."):
+            
+            for i in range(0, total_samples, mini_batch):
                 mini_inputs = {}
                 for k in inputs:
                     if isinstance(inputs[k], torch.Tensor):
@@ -415,7 +367,6 @@ def run_mbq(
                 mini_inputs["inputs_embeds"] = mini_inputs["inputs_embeds"].detach().requires_grad_(True)
                 mini_inputs["use_cache"] = False
                 mini_inputs["return_dict"] = True
-                
                 outputs = model(**mini_inputs)
 
                 loss = outputs[0]
@@ -445,17 +396,17 @@ def run_mbq(
         mlp_median = np.median(mlp_list)
 
 
-
     if distort:
-        # assert wa_quant, "We only support distort input in weight-activation quantization!!!"
+        assert wa_quant, "We only support distort input in weight-activation quantization!!!"
         print("Use distort input...")
         inps_distort = copy.deepcopy(inps)
 
     gc.collect()
     empty_cache(device)
 
+    model.to_cpu()
     # solve layer by layer
-    for i in tqdm.tqdm(range(len(layers)), desc="Running MBQ..."):
+    for i in tqdm.tqdm(range(len(layers)), desc="Running LAT-AWQ..."):
         layer = layers[i]
         layer = layer.to(device)
         named_linears = get_named_linears(layer)
@@ -510,67 +461,46 @@ def run_mbq(
         if (
             auto_scale
         ):  # if it applies, we should also modify the input_feat with scales
-            if not reweight:
-                ans_mask = None
-                vis_mask = None
-            else:
-                ans_mask = caption_mask
-                vis_mask = vision_mask
+            # LAT-AWQ always consumes available masks for saliency/importance.
+            # The scale-search helper separately reproduces AWQ's vision-mask
+            # objective whenever token_weighted_loss is disabled.
+            ans_mask = caption_mask
+            vis_mask = vision_mask
             
-            if wa_quant:
-                if distort:
-                    scales_list = auto_scale_block_wa_distort(
-                        layer,
-                        layer_kwargs,
-                        w_bit=w_bit,
-                        a_bit=a_bit,
-                        q_config=q_config,
-                        input_feat=input_feat,
-                        ans_mask=ans_mask,
-                        vis_mask=vis_mask,
-                        reweight_ratio_dict=scale_reweight_ratio_dict,
-                        q_input=inps_distort,
-                        loss_mode=loss_mode
-                    )
-                else:
-                    scales_list = auto_scale_block_wa(
-                        layer,
-                        layer_kwargs,
-                        w_bit=w_bit,
-                        a_bit=a_bit,
-                        q_config=q_config,
-                        input_feat=input_feat,
-                        ans_mask=ans_mask,
-                        vis_mask=vis_mask,
-                        reweight_ratio_dict=scale_reweight_ratio_dict,
-                        loss_mode=loss_mode
-                    )
+            if wa_quant and distort:
+                scales_list = auto_scale_block_wa_distort(
+                    layer,
+                    layer_kwargs,
+                    w_bit=w_bit,
+                    a_bit=a_bit,
+                    q_config=q_config,
+                    input_feat=input_feat,
+                    ans_mask=ans_mask,
+                    vis_mask=vis_mask,
+                    reweight_ratio_dict=scale_reweight_ratio_dict,
+                    q_input=inps_distort,
+                    loss_mode=loss_mode
+                )
             else:
-                if distort:
-                    scales_list = auto_scale_block_distort(
-                        layer,
-                        layer_kwargs,
-                        w_bit=w_bit,
-                        q_config=q_config,
-                        input_feat=input_feat,
-                        ans_mask=ans_mask,
-                        vis_mask=vis_mask,
-                        reweight_ratio_dict=scale_reweight_ratio_dict,
-                        q_input=inps_distort,
-                        loss_mode=loss_mode
-                    )
-                else:
-                    scales_list = auto_scale_block(
-                        layer,
-                        layer_kwargs,
-                        w_bit=w_bit,
-                        q_config=q_config,
-                        input_feat=input_feat,
-                        ans_mask=ans_mask,
-                        vis_mask=vis_mask,
-                        reweight_ratio_dict=scale_reweight_ratio_dict,
-                        loss_mode=loss_mode
-                    )
+                scales_list = auto_scale_block(
+                    layer,
+                    layer_kwargs,
+                    w_bit=w_bit,
+                    a_bit=a_bit,
+                    q_config=q_config,
+                    input_feat=input_feat,
+                    ans_mask=ans_mask,
+                    vis_mask=vis_mask,
+                    reweight_ratio_dict=scale_reweight_ratio_dict,
+                    loss_mode=loss_mode,
+                    layer_idx=i,
+                    token_aware_saliency=token_aware_saliency,
+                    token_weighted_loss=token_weighted_loss,
+                    saliency_mix_lambda=saliency_mix_lambda,
+                    wa_quant=wa_quant,
+                    lat_debug=lat_debug,
+                    debug_path=debug_path,
+                )
 
             # apply_scale(layer, scales_list, input_feat_dict=input_feat)
             apply_scale(layers[i], scales_list, input_feat_dict=input_feat)
@@ -596,27 +526,10 @@ def run_mbq(
                         batch_size=get_scale_search_batch_size(inps_distort.shape[0]),
                         device=layer_q_device,
                     )
-                    del layer_q 
-                else:
-                    layer_q = copy.deepcopy(layer)
-                    layer_q = layer_q.to(device)
-                    named_linears_q = get_named_linears(layer_q)
-                    for n, m in named_linears_q.items():
-                        m.weight.data = pseudo_quantize_tensor(m.weight.data, n_bits=w_bit, **q_config)
-                        empty_cache(device)
-                    
-                    layer_q_device = next(layer_q.parameters()).device
-                    inps_distort = forward_module_in_batches(
-                        layer_q,
-                        inps_distort,
-                        layer_kwargs,
-                        batch_size=get_scale_search_batch_size(inps_distort.shape[0]),
-                        device=layer_q_device,
-                    )
-                    del layer_q 
+                    del layer_q
 
             # append prefix to make names global
-            mbq_results["scale"] += append_str_prefix(
+            lat_awq_results["scale"] += append_str_prefix(
                 scales_list, get_op_name(model.model, layer) + "."
             )
 
@@ -629,8 +542,8 @@ def run_mbq(
         gc.collect()
         empty_cache(device)
 
-    return mbq_results
+    return lat_awq_results
 
 
-def apply_mbq(model, mbq_results):
-    apply_scale(model, mbq_results["scale"])
+def apply_lat_awq(model, lat_awq_results):
+    apply_scale(model, lat_awq_results["scale"])

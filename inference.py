@@ -65,7 +65,7 @@ def parse_quant_infer_args() -> argparse.Namespace:
     parser.add_argument("--text_data_path", default="", type=str)
 
     # TODO: quantization parameters
-    parser.add_argument("--method", default="none", choices=["none", "fp16", "awq", "smoothquant", "mbq", "qig", "rtn", "gptq", None])
+    parser.add_argument("--method", default="none", choices=["none", "fp16", "awq", "smoothquant", "mbq", "qig", "lat_awq", "rtn", "gptq", None])
     parser.add_argument("--w_bit", default=8, type=int)
     parser.add_argument("--a_bit", default=16, type=int)
     parser.add_argument("--w_group", default=128, type=int)
@@ -77,6 +77,13 @@ def parse_quant_infer_args() -> argparse.Namespace:
     parser.add_argument("--run_process", action="store_true")
     parser.add_argument("--pseudo_quant", action="store_true")
     parser.add_argument("--percdamp", default=0.01, type=float)
+    parser.add_argument("--token_aware_saliency", action="store_true")
+    parser.add_argument("--token_weighted_loss", action="store_true")
+    parser.add_argument("--saliency_mix_lambda", default=1.0, type=float)
+    parser.add_argument("--lat_debug", action="store_true")
+    parser.add_argument("--lat_output_dir", default="outputs/lat_awq", type=str)
+    parser.add_argument("--lat_log_dir", default="logs/lat_awq", type=str)
+    parser.add_argument("--seed", default=42, type=int)
     
     ## inference parameters
     parser.add_argument("--infer_pairs", default=None, type=str,
@@ -229,6 +236,9 @@ def cli_quant_single(args: Union[argparse.Namespace, None] = None) -> None:
                 "loss_mode": args.loss_mode,
                 "scale_path": args.scale_path,
                 "pseudo_quant": bool(args.pseudo_quant),
+                "token_aware_saliency": bool(args.token_aware_saliency),
+                "token_weighted_loss": bool(args.token_weighted_loss),
+                "saliency_mix_lambda": args.saliency_mix_lambda,
             }
 
         run_inference(

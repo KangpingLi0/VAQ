@@ -104,7 +104,7 @@ def parse_quant_args() -> argparse.Namespace:
 
 
     # TODO: quantization parameters
-    parser.add_argument("--method", default="awq", choices=["awq", "smoothquant", "mbq", "qig","rtn", "gptq", "omniquant", None])
+    parser.add_argument("--method", default="awq", choices=["awq", "smoothquant", "mbq", "qig", "lat_awq", "rtn", "gptq", "omniquant", None])
     parser.add_argument("--w_bit", default=8, type=int)
     parser.add_argument("--a_bit", default=16, type=int)
     parser.add_argument("--w_group", default=128, type=int)
@@ -116,6 +116,13 @@ def parse_quant_args() -> argparse.Namespace:
     parser.add_argument("--run_process", action="store_true")
     parser.add_argument("--pseudo_quant", action="store_true")
     parser.add_argument("--percdamp", default=0.01, type=float)
+    parser.add_argument("--token_aware_saliency", action="store_true")
+    parser.add_argument("--token_weighted_loss", action="store_true")
+    parser.add_argument("--saliency_mix_lambda", default=1.0, type=float)
+    parser.add_argument("--lat_debug", action="store_true")
+    parser.add_argument("--lat_output_dir", default="outputs/lat_awq", type=str)
+    parser.add_argument("--lat_log_dir", default="logs/lat_awq", type=str)
+    parser.add_argument("--seed", default=42, type=int)
     
     args = parser.parse_args()
     return args
@@ -156,6 +163,22 @@ def _slice_cached_calib(obj, n_samples: int):
     return obj
 
 
+def _calibration_batch_size(obj):
+    if torch.is_tensor(obj) and obj.ndim > 0:
+        return int(obj.shape[0])
+    if isinstance(obj, dict):
+        for value in obj.values():
+            size = _calibration_batch_size(value)
+            if size is not None:
+                return size
+    if isinstance(obj, (list, tuple)):
+        for value in obj:
+            size = _calibration_batch_size(value)
+            if size is not None:
+                return size
+    return None
+
+
 def cli_quant(args: Union[argparse.Namespace, None] = None) -> None:
     if not args:
         args = parse_quant_args()
@@ -185,6 +208,8 @@ def cli_quant_single(args: Union[argparse.Namespace, None] = None) -> None:
     # here we load MLLMs outside of the evaluator.
     if args.model_args is None:
         args.model_args = ""
+    torch.manual_seed(getattr(args, "seed", 42))
+    np.random.seed(getattr(args, "seed", 42))
     device = get_device(args.device)
     args.torch_device = device
     args.model_args = _prepare_model_args_for_device(args.model_args, device)
@@ -299,6 +324,7 @@ def cli_quant_single(args: Union[argparse.Namespace, None] = None) -> None:
         return
 
     # Wrapper the quantized model.
+    args.effective_n_samples = _calibration_batch_size(prompt_inputs)
     qwrapper(process_model, prompt_inputs, prompt_kwargs, args)
 
     

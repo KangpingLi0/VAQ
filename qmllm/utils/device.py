@@ -114,6 +114,48 @@ def get_act_scale_in_batches(
 
 
 @torch.no_grad()
+def finite_act_scale_in_batches(
+    x: torch.Tensor,
+    batch_size: int | None = None,
+    device: torch.device | str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return finite calibration inputs and FP32 per-channel activation scales.
+
+    The common AWQ-style normalization is especially vulnerable to a single
+    NaN/Inf hidden state.  Avoid scanning/copying the large calibration tensor
+    unless the much smaller channel statistic proves that recovery is needed.
+    """
+    x_max = get_act_scale_in_batches(x, batch_size=batch_size, device=device).float()
+    if torch.isfinite(x_max).all():
+        return x, x_max
+
+    x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+    x_max = get_act_scale_in_batches(x, batch_size=batch_size, device=device).float()
+    if not torch.isfinite(x_max).all():
+        raise FloatingPointError(
+            "activation statistics remain non-finite after sanitization"
+        )
+    return x, x_max
+
+
+@torch.no_grad()
+def normalized_power_scales(
+    x_max: torch.Tensor,
+    ratio: float,
+    min_scale: float = 1e-4,
+) -> torch.Tensor:
+    """Build finite AWQ-style scales without fp16 product overflow."""
+    scales = x_max.float().pow(float(ratio)).clamp(min=min_scale).view(-1)
+    normalizer = (scales.max() * scales.min()).clamp_min(1e-12).sqrt()
+    scales = scales / normalizer
+    if not torch.isfinite(scales).all():
+        raise FloatingPointError(
+            f"non-finite normalized scales at ratio={float(ratio)}"
+        )
+    return scales
+
+
+@torch.no_grad()
 def reconstruction_loss_in_batches(
     baseline_module: nn.Module,
     baseline_x: torch.Tensor,

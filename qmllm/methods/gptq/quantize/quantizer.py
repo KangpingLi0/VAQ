@@ -28,7 +28,15 @@ class GPTQ:
         self.H *= self.nsamples / (self.nsamples + tmp)
         self.nsamples += tmp
         # inp = inp.float()
-        inp = math.sqrt(2 / self.nsamples) * inp.float()
+        inp = inp.float()
+        if not torch.isfinite(inp).all():
+            count = int((~torch.isfinite(inp)).sum().item())
+            logging.warning(
+                "GPTQ calibration input contains %s NaN/Inf values; replacing them with zero",
+                count,
+            )
+            inp = torch.nan_to_num(inp, nan=0.0, posinf=0.0, neginf=0.0)
+        inp = math.sqrt(2 / self.nsamples) * inp
         # self.H += 2 / self.nsamples * inp.matmul(inp.t())
         self.H += inp.matmul(inp.t())
 
@@ -73,28 +81,46 @@ class GPTQ:
         diag = torch.arange(self.columns, device=self.dev)
         H[diag, diag] += damp
         ori_type = H.dtype
-        H = H.to(torch.float64)
+        # Ascend does not implement float64 Cholesky natively.  Letting the
+        # backend fall back implicitly can cast the matrix back to float32 and
+        # has produced a non-finite inverse for otherwise valid PSD Hessians.
+        # Do the small linear-algebra step explicitly on CPU in float64, then
+        # move only the resulting factor back to the accelerator.
+        H = H.detach().to(device="cpu", dtype=torch.float64)
+        H = (H + H.transpose(0, 1)) * 0.5
+        if not torch.isfinite(H).all():
+            count = int((~torch.isfinite(H)).sum().item())
+            logging.warning(
+                "GPTQ Hessian contains %s NaN/Inf values; replacing them with zero",
+                count,
+            )
+            H = torch.nan_to_num(H, nan=0.0, posinf=0.0, neginf=0.0)
+        cpu_diag = torch.arange(self.columns, device=H.device)
         base_jitter = max(float(damp.detach().cpu()), float(mean_diag.detach().cpu()) * 1e-6, 1e-6)
         last_err = None
         for attempt in range(8):
+            jitter = base_jitter * (10 ** attempt)
+            trial = H.clone()
+            trial[cpu_diag, cpu_diag] += jitter
             try:
-                H = torch.linalg.cholesky(H)
-                break
-            except torch._C._LinAlgError as err:
+                chol = torch.linalg.cholesky(trial)
+                candidate = torch.cholesky_inverse(chol)
+                candidate = torch.linalg.cholesky(candidate, upper=True)
+                if torch.isfinite(candidate).all():
+                    Hinv = candidate
+                    break
+                last_err = ValueError("inverse-Hessian factor contains NaN or Inf")
+            except (torch._C._LinAlgError, RuntimeError) as err:
                 last_err = err
-                jitter = base_jitter * (10 ** attempt)
-                logging.warning(
-                    "GPTQ Cholesky failed on attempt %s; adding diagonal jitter %.6g",
-                    attempt + 1,
-                    jitter,
-                )
-                H[diag, diag] += jitter
+            logging.warning(
+                "GPTQ Hessian factorization failed on attempt %s; retrying with diagonal jitter %.6g (%s)",
+                attempt + 1,
+                jitter,
+                last_err,
+            )
         else:
             raise last_err
-        H = torch.cholesky_inverse(H)
-        H = torch.linalg.cholesky(H, upper=True)
-        H = H.to(ori_type)
-        Hinv = H
+        Hinv = Hinv.to(device=self.dev, dtype=ori_type)
 
         for i1 in range(0, self.columns, blocksize):
             i2 = min(i1 + blocksize, self.columns)
@@ -109,6 +135,10 @@ class GPTQ:
             for i in range(count):
                 w = W1[:, i]
                 d = Hinv1[i, i]
+                if not torch.isfinite(d) or d.abs().item() < 1e-12:
+                    raise ValueError(
+                        f"GPTQ inverse-Hessian diagonal is invalid at column {i1 + i}: {d.item()}"
+                    )
 
                 if groupsize != -1:
                     if not static_groups:
@@ -141,8 +171,12 @@ class GPTQ:
         self.layer.weight.data = Q.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
         if torch.any(torch.isnan(self.layer.weight.data)):
             logging.warning('NaN in weights')
-            import pprint
-            pprint.pprint(self.quantizer.bits, self.quantizer.scale, self.quantizer.zero_point)
+            logging.warning(
+                "GPTQ quantizer state: bits=%s scale_finite=%s zero_finite=%s",
+                self.quantizer.bits,
+                bool(torch.isfinite(self.quantizer.scale).all()),
+                bool(torch.isfinite(self.quantizer.zero).all()),
+            )
             raise ValueError('NaN in weights')
 
     def free(self):

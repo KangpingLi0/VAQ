@@ -26,6 +26,7 @@ IGNORE_TOKEN_ID = LabelSmoother.ignore_index
 
 from qmllm.models.base import BaseModel
 from qmllm.utils.registry import MODEL_REGISTRY
+from utils.device import get_device
 
 @MODEL_REGISTRY.register("internvl2")
 class InternVL2(BaseModel):
@@ -44,6 +45,25 @@ class InternVL2(BaseModel):
         self.max_dynamic_patch = 1
         self.normalize_type = "imagenet"
         self.group_by_length = True
+        self.device = get_device("auto")
+
+    def set_device(self, device):
+        """Remember the accelerator selected by main.py/main_quant.py."""
+        self.device = get_device(device)
+
+    def to_device(self, device=None):
+        """Move the model without assuming that the accelerator is CUDA."""
+        if device is not None:
+            self.set_device(device)
+        if self.device.type == "cuda" and torch.cuda.device_count() > 1:
+            device_map = self.split_model(self.model.language_model.config.num_hidden_layers)
+            self.model = dispatch_model(self.model, device_map=device_map)
+        else:
+            # InternVL is loaded as bfloat16 and its lmms adapter prepares
+            # pixel inputs in bfloat16.  Preserve that dtype during moves;
+            # forcing float16 here makes Conv2d inputs and biases disagree.
+            self.model = self.model.to(device=self.device)
+        return self.model
 
     def fetch_vit(self):
         return self.model.vision_model
@@ -183,14 +203,9 @@ class InternVL2(BaseModel):
          
 
     def to_cuda(self):
-        # if self.num_params > 20 * 10 ** 9: # 20B model
-        if torch.cuda.device_count() > 1:
-            # TODO: ugly comment the previous code for InternVL2-26B eval, remove it!!!
-            device_map = self.split_model(self.model.language_model.config.num_hidden_layers)
-            self.model = dispatch_model(self.model, device_map=device_map)
-            # self.model = self.model.cuda()
-        else:
-            self.model = self.model.cuda()
+        # Kept for the existing quantization entry-point API.  The actual
+        # destination is the accelerator selected by set_device().
+        self.to_device(self.device)
 
     def to_cpu(self):
         if self.num_params > 20 * 10 ** 9: # 20B model
@@ -432,11 +447,13 @@ class InternVL2(BaseModel):
 
     @torch.no_grad()   
     def generate_input(self, data_samples):
-        input_ids = data_samples['input_ids'].cuda()
-        attention_mask = data_samples['attention_mask'].cuda()
-        labels = data_samples['labels'].cuda() 
-        pixel_values = data_samples['pixel_values'].to(self.model.dtype).cuda()
-        image_flags = data_samples['image_flags'].cuda() 
+        input_ids = data_samples['input_ids'].to(self.device)
+        attention_mask = data_samples['attention_mask'].to(self.device)
+        labels = data_samples['labels'].to(self.device)
+        pixel_values = data_samples['pixel_values'].to(
+            device=self.device, dtype=self.model.dtype
+        )
+        image_flags = data_samples['image_flags'].to(self.device)
         
         # generate input embeddings
         # copied from the InternVLChatModel.forward
@@ -539,4 +556,3 @@ class InternVL2(BaseModel):
             if k in ('sample_id'):
                 batch[k] = [f[k] for f in instances]
         return batch
-

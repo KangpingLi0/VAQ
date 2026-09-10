@@ -13,7 +13,13 @@ from transformers.models.llama.modeling_llama import LlamaForCausalLM
 from qmllm.calibration.pileval import get_calib_dataset
 from qmllm.calibration.coco_vl import get_multimodal_calib_dataset
 from qmllm.utils.search import append_str_prefix, get_op_name
-from qmllm.utils.device import empty_cache, forward_module_in_batches, module_device, move_to_device
+from qmllm.utils.device import (
+    empty_cache,
+    forward_module_in_batches,
+    get_scale_search_batch_size,
+    module_device,
+    move_to_device,
+)
 from qmllm.utils.hf_compat import get_qwen_vl_layers, move_qwen_vl_embeddings
 
 from qmllm.methods.awq.quantize.auto_scale import auto_scale_block, apply_scale
@@ -208,7 +214,14 @@ def run_awq(
             )
         # get output as next layer's input
         layer_device = next(layer.parameters()).device
-        inps = forward_module_in_batches(layer, inps, layer_kwargs, batch_size=1, device=layer_device)
+        layer_batch_size = get_scale_search_batch_size(inps.shape[0])
+        inps = forward_module_in_batches(
+            layer,
+            inps,
+            layer_kwargs,
+            batch_size=layer_batch_size,
+            device=layer_device,
+        )
         for h in handles:
             h.remove()
         # now solve for scaling
