@@ -17,7 +17,7 @@ from transformers.models.llama.modeling_llama import LlamaForCausalLM
 
 from qmllm.methods.gptq.quantize.qmodule import find_qlayers, WeightQuantizer
 from qmllm.methods.gptq.quantize.quantizer import GPTQ, cleanup_memory
-from qmllm.utils.device import empty_cache, forward_module_in_batches, move_to_device
+from qmllm.utils.device import empty_cache, forward_module_in_batches, move_to_device, get_scale_search_batch_size, prepare_calibration_capture
 from qmllm.utils.hf_compat import get_qwen_vl_layers, move_qwen_vl_embeddings
 
 __all__ = ["run_gptq"]
@@ -162,7 +162,7 @@ def run_gptq(model,
     dtype = next(iter(model.model.parameters())).dtype
 
     inputs, vision_mask, caption_mask = process_input(prompt_inputs, prompt_kwargs)
-    inputs = move_to_device(inputs, device)
+    inputs, capture_device = prepare_calibration_capture(model, inputs, device)
     # nsamples = inputs['inputs_embeds'].shape[0]
 
     inps = []
@@ -225,7 +225,7 @@ def run_gptq(model,
             handles = []
             handles.append(named_linears[name].register_forward_hook(add_batch(name)))
             layer_device = next(layer.parameters()).device
-            outs = forward_module_in_batches(layer, inps, layer_kwargs, batch_size=1, device=layer_device)
+            outs = forward_module_in_batches(layer, inps, layer_kwargs, batch_size=get_scale_search_batch_size(inps.shape[0]), device=layer_device)
             for h in handles:
                 h.remove()
             
@@ -237,7 +237,7 @@ def run_gptq(model,
             gptq[name].free()
 
         layer_device = next(layer.parameters()).device
-        outs = forward_module_in_batches(layer, inps, layer_kwargs, batch_size=1, device=layer_device)
+        outs = forward_module_in_batches(layer, inps, layer_kwargs, batch_size=get_scale_search_batch_size(inps.shape[0]), device=layer_device)
         layers[i] = layer.cpu()
         del layer
         del gptq

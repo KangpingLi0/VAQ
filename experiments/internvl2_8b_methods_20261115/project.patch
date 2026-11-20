@@ -1,0 +1,560 @@
+--- /dev/null
++++ b/general_run.py
+@@ -0,0 +1,150 @@
++"""Controlled LAT-AWQ core ablations: one public checkpoint, matched calibration and evaluation."""
++import argparse
++import hashlib
++import json
++import os
++from pathlib import Path
++import sys
++import time
++from types import SimpleNamespace
++
++SOURCE = Path(__file__).resolve().parent
++sys.path.insert(0, str(SOURCE))
++OUT = Path('/data/lkp/VAQ/outputs/lat_awq_general_20261107')
++MODEL = '/data/lkp/models/Qwen2.5-VL-7B-Instruct'
++
++
++def save(path, value):
++    path = Path(path);path.parent.mkdir(parents=True, exist_ok=True)
++    temporary = path.with_suffix(path.suffix + '.tmp')
++    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2));temporary.replace(path)
++
++
++def cache_path(args):
++    return OUT / f'calibration_n{args.n}_seed{args.seed}.pt'
++
++
++def name(args):
++    return f'w{args.w}a{args.a}_{args.variant}_seed{args.seed}' + ('_smoke' if args.n == 2 else '')
++
++
++def load_model():
++    import torch
++    import torch_npu
++    from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
++    from qmllm.models import get_process_model
++    torch.set_num_threads(8)
++    torch.npu.set_device(0)
++    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
++        MODEL, torch_dtype=torch.float16, attn_implementation='sdpa', local_files_only=True).eval()
++    print('[general] model loaded on CPU; moving to NPU', flush=True)
++    model = model.to('npu:0')
++    print('[general] model moved; loading processor', flush=True)
++    processor = AutoProcessor.from_pretrained(MODEL, min_pixels=200704, max_pixels=1605632,
++                                               use_fast=True, local_files_only=True)
++    adapter = get_process_model('qwen2_5_vl')(model, processor.tokenizer, processor)
++    adapter.set_device('npu:0')
++    print('[general] model and processor ready', flush=True)
++    return model, processor, adapter
++
++
++def calibrate(args):
++    import torch
++    from qmllm.calibration.coco_vl import get_multimodal_calib_dataset
++    if cache_path(args).exists():
++        return
++    model, processor, adapter = load_model()
++    selection = OUT / f'calibration_n128_seed{args.seed}.json'
++    inputs, kwargs = get_multimodal_calib_dataset(str(selection), '', adapter, n_samples=args.n,
++                                                 micro_bs=1, shuffle=False, image_size=None)
++    assert inputs['inputs_embeds'].shape[0] == args.n, 'calibration sample count changed'
++    assert torch.isfinite(inputs['inputs_embeds']).all(), 'non-finite calibration embeddings'
++    destination = cache_path(args);temporary = destination.with_suffix('.tmp')
++    torch.save({'prompt_inputs': inputs, 'prompt_kwargs': kwargs}, temporary);temporary.replace(destination)
++    save(destination.with_suffix('.meta.json'), {
++        'model': MODEL, 'cases': args.n, 'seed': args.seed, 'selection': str(selection),
++        'shape': list(inputs['inputs_embeds'].shape), 'min_pixels': 200704, 'max_pixels': 1605632,
++        'selection_sha256': hashlib.sha256(selection.read_bytes()).hexdigest(),
++    })
++
++
++def quantize(args):
++    import torch
++    from transformers import Qwen2_5_VLForConditionalGeneration
++    from qmllm.quantization.quant_wrapper import qwrapper
++    from qmllm.utils.hf_compat import get_qwen_vl_layers
++    torch.manual_seed(args.seed)
++    run = OUT / name(args);run.mkdir(exist_ok=True)
++    if (run / 'quantization.json').exists() and (run / 'quantized_state.pt').exists():
++        return
++    model, processor, adapter = load_model()
++    cache = torch.load(str(cache_path(args)), map_location='cpu', weights_only=True, mmap=True)
++    cache_metadata = json.loads(cache_path(args).with_suffix('.meta.json').read_text())
++    selection = OUT / f'calibration_n128_seed{args.seed}.json'
++    assert cache_metadata['selection_sha256'] == hashlib.sha256(selection.read_bytes()).hexdigest(), 'calibration selection changed'
++    assert cache['prompt_inputs']['inputs_embeds'].shape[0] == args.n, 'wrong calibration cache'
++    s, l = {'A': (False, False), 'B': (True, False), 'C': (False, True), 'D': (True, True)}[args.variant]
++    options = SimpleNamespace(method='lat_awq', model='qwen2_5_vl', model_args=f'pretrained={MODEL}',
++        w_bit=args.w, a_bit=args.a, w_group=128, alpha=.5, run_process=True, pseudo_quant=False,
++        reweight=False, distort=False, loss_mode='mse', scale_path=str(run / 'scales.pt'),
++        torch_device=torch.device('npu:0'), token_aware_saliency=s, token_weighted_loss=l,
++        saliency_mix_lambda=.5, lat_debug=True, lat_log_dir=str(run / 'search_logs'),
++        lat_output_dir=str(run / 'search_metadata'), effective_n_samples=args.n, seed=args.seed)
++    started = time.time()
++    before = get_qwen_vl_layers(model)[0].self_attn.q_proj.weight[:1].detach().cpu().clone()
++    save(run / 'configuration.json', {
++        'variant': args.variant, 's': s, 'l': l, 'lambda': .5, 'w_bit': args.w, 'a_bit': args.a,
++        'n': args.n, 'calibration_seed': args.seed, 'ig_steps': 32,
++        'calibration_selection_sha256': cache_metadata['selection_sha256'],
++        'weight_quantizer': 'symmetric_absmax_per_channel' if args.a < 16 else 'asymmetric_group_128',
++        'activation_quantizer': 'dynamic_symmetric_absmax_per_token' if args.a < 16 else 'FP16',
++        'quantization_scope': 'decoder linear layers only; vision encoder, embeddings and lm_head FP16',
++        'mask_policy': 'same valid vision+answer token pool; padding excluded in statistics, IG, IQR and loss',
++        'sample_weighting': 'equal mass per calibration case',
++        'reconstruction_arithmetic': ('shared strict FP32 subtraction and squared error for every S/L setting'
++                                    if args.a == 16 else 'shared repository W/A reconstruction routine for every S/L setting'),
++        'wa_gradient_mode': 'existing stop-gradient quantized branch; common to all W4A8 variants',
++        'model': MODEL, 'min_pixels': 200704, 'max_pixels': 1605632,
++        'comparison_policy': 'all four variants use identical data, quantizer, search grid and evaluation settings',
++        'full_method_is_fresh_run': True,
++    })
++    qwrapper(adapter, cache['prompt_inputs'], cache['prompt_kwargs'], options)
++    search_seconds = time.time() - started
++    adapter.to_cpu()
++    original = Qwen2_5_VLForConditionalGeneration.from_pretrained(
++        MODEL, torch_dtype=torch.float16, attn_implementation='sdpa', local_files_only=True)
++    adapter.model.load_state_dict(original.state_dict(), strict=True);del original
++    options.run_process = False;options.pseudo_quant = True
++    qwrapper(adapter, None, None, options)
++    after = get_qwen_vl_layers(adapter.model)[0].self_attn.q_proj.weight[:1].detach().cpu()
++    assert not torch.equal(before, after), 'quantization did not change weights'
++    groups = after.reshape(-1, 128) if args.a == 16 else after.reshape(1, -1)
++    assert all(group.unique().numel() <= 2 ** args.w for group in groups), 'weight values do not match requested bit grid'
++    for layer in get_qwen_vl_layers(adapter.model):
++        for module in layer.modules():
++            if hasattr(module, 'weight'):
++                assert torch.isfinite(module.weight).all(), 'non-finite quantized parameters'
++    temporary = run / 'quantized_state.tmp'
++    torch.save({key: value.detach().cpu() for key, value in adapter.model.state_dict().items()}, temporary)
++    temporary.replace(run / 'quantized_state.pt')
++    save(run / 'quantization.json', {'complete': True, 'search_seconds': search_seconds,
++         'total_seconds': time.time() - started, 'representation': 'fake-quantized FP16 tensors',
++         'activation_wrappers': sum(type(m).__name__ == 'WALinear' for m in adapter.model.modules()),
++         'reference_weight_changed': True, 'calibration_cases': args.n,
++         'reference_weight_bit_grid_verified': True,
++         'configuration': json.loads((run / 'configuration.json').read_text())})
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument('mode', choices=['calibration', 'quant'])
++    parser.add_argument('--variant', choices=['A', 'B', 'C', 'D'], default='D')
++    parser.add_argument('--w', type=int, default=3);parser.add_argument('--a', type=int, default=16)
++    parser.add_argument('--n', type=int, default=128);parser.add_argument('--seed', type=int, default=42)
++    args = parser.parse_args()
++    if args.mode == 'calibration':calibrate(args)
++    else:quantize(args)
++
++
++if __name__ == '__main__':
++    main()
+--- a/main.py
++++ b/main.py
+@@ -9,6 +9,7 @@
+ from functools import partial
+ 
+ import numpy as np
++import torch
+ import yaml
+ 
+ warnings.simplefilter("ignore", category=DeprecationWarning)
+@@ -293,6 +294,8 @@
+     parser.add_argument("--scale_path", default=None, type=str)
+     parser.add_argument("--run_process", action="store_true")
+     parser.add_argument("--pseudo_quant", action="store_true")
++    parser.add_argument("--quantized_state", default=None, type=str)
++    parser.add_argument("--bootstrap_iters", default=1000, type=int)
+     # for GPTQ
+     parser.add_argument("--percdamp", default=0.01, type=float)
+     parser.add_argument("--token_aware_saliency", action="store_true")
+@@ -515,7 +518,7 @@
+     if args.model_args is None:
+         args.model_args = ""
+     
+-    ModelClass = get_model(args.model)
++    ModelClass = get_model(args.model, force_simple=True)
+     lm = ModelClass.create_from_arg_string(
+         args.model_args,
+         {
+@@ -524,7 +527,15 @@
+         },
+     )
+     # 
+-    if args.pseudo_quant:
++    if args.quantized_state:
++        if args.a_bit < 16:
++            from qmllm.methods.rtn.quantizer import pseudo_quantize_model_weight_act
++            pseudo_quantize_model_weight_act(lm._model, args.w_bit, args.a_bit)
++        state = torch.load(args.quantized_state, map_location='cpu', weights_only=True, mmap=True)
++        lm._model.load_state_dict(state, strict=True)
++        del state
++        print(f'Loaded complete quantized state: {args.quantized_state}', flush=True)
++    elif args.pseudo_quant:
+         print("Pseudo quant...")
+         Process_ModelClass = get_process_model(args.model)
+         process_model = Process_ModelClass(lm._model, 
+@@ -552,12 +563,18 @@
+ 
+         qwrapper(process_model, prompt_inputs, prompt_kwargs, args)
+ 
++    def require_finite_logits(module, inputs, output):
++        if not bool(torch.isfinite(output).all()):
++            raise FloatingPointError('Non-finite generation logits; evaluation stopped before scoring')
++    lm._model.lm_head.register_forward_hook(require_finite_logits)
++
+     results = evaluator.simple_evaluate(
+         # model=args.model,
+         # lm=lm,
+         model=lm,
+         model_args=args.model_args,
+         tasks=task_names,
++        bootstrap_iters=args.bootstrap_iters,
+         num_fewshot=args.num_fewshot,
+         batch_size=args.batch_size,
+         max_batch_size=args.max_batch_size,
+--- a/qmllm/methods/awq/quantize/pre_quant.py
++++ b/qmllm/methods/awq/quantize/pre_quant.py
+@@ -19,6 +19,7 @@
+     get_scale_search_batch_size,
+     module_device,
+     move_to_device,
++    prepare_calibration_capture,
+ )
+ from qmllm.utils.hf_compat import get_qwen_vl_layers, move_qwen_vl_embeddings
+ 
+@@ -167,9 +168,10 @@
+     # patch layer 0 to catch input and kwargs
+     layers[0] = Catcher(layers[0])
+     inputs, vision_mask, caption_mask = process_input(prompt_inputs, prompt_kwargs)
+-    inputs = move_to_device(inputs, device)
+-
+-    model.to_cuda()
++    inputs, capture_device = prepare_calibration_capture(model, inputs, device)
++
++    if capture_device.type != "cpu" or device.type == "cpu":
++        model.to_cuda()
+     try:
+         model(**inputs)
+     except ValueError: # work with early exit
+--- a/qmllm/methods/gptq/entry.py
++++ b/qmllm/methods/gptq/entry.py
+@@ -3,8 +3,6 @@
+ from accelerate import Accelerator
+ import torch, gc
+ from qmllm.methods.gptq.quantize.pre_quant import run_gptq
+-from lmms_eval.models import get_model
+-from qmllm.models import get_process_model
+ 
+ accelerator = Accelerator()
+ 
+--- a/qmllm/methods/gptq/quantize/pre_quant.py
++++ b/qmllm/methods/gptq/quantize/pre_quant.py
+@@ -17,7 +17,7 @@
+ 
+ from qmllm.methods.gptq.quantize.qmodule import find_qlayers, WeightQuantizer
+ from qmllm.methods.gptq.quantize.quantizer import GPTQ, cleanup_memory
+-from qmllm.utils.device import empty_cache, forward_module_in_batches, move_to_device
++from qmllm.utils.device import empty_cache, forward_module_in_batches, move_to_device, get_scale_search_batch_size, prepare_calibration_capture
+ from qmllm.utils.hf_compat import get_qwen_vl_layers, move_qwen_vl_embeddings
+ 
+ __all__ = ["run_gptq"]
+@@ -162,7 +162,7 @@
+     dtype = next(iter(model.model.parameters())).dtype
+ 
+     inputs, vision_mask, caption_mask = process_input(prompt_inputs, prompt_kwargs)
+-    inputs = move_to_device(inputs, device)
++    inputs, capture_device = prepare_calibration_capture(model, inputs, device)
+     # nsamples = inputs['inputs_embeds'].shape[0]
+ 
+     inps = []
+@@ -225,7 +225,7 @@
+             handles = []
+             handles.append(named_linears[name].register_forward_hook(add_batch(name)))
+             layer_device = next(layer.parameters()).device
+-            outs = forward_module_in_batches(layer, inps, layer_kwargs, batch_size=1, device=layer_device)
++            outs = forward_module_in_batches(layer, inps, layer_kwargs, batch_size=get_scale_search_batch_size(inps.shape[0]), device=layer_device)
+             for h in handles:
+                 h.remove()
+             
+@@ -237,7 +237,7 @@
+             gptq[name].free()
+ 
+         layer_device = next(layer.parameters()).device
+-        outs = forward_module_in_batches(layer, inps, layer_kwargs, batch_size=1, device=layer_device)
++        outs = forward_module_in_batches(layer, inps, layer_kwargs, batch_size=get_scale_search_batch_size(inps.shape[0]), device=layer_device)
+         layers[i] = layer.cpu()
+         del layer
+         del gptq
+--- a/qmllm/methods/lat_awq/quantize/auto_scale.py
++++ b/qmllm/methods/lat_awq/quantize/auto_scale.py
+@@ -167,7 +167,7 @@
+         kwargs = kwargs or {}
+         batch_size = get_scale_search_batch_size(x.shape[0])
+ 
+-        def _compute_token_importance_weights(block, x, x_q, kwargs, block_q=None):  # noqa: keep signature
++        def _compute_token_importance_weights(block, x, x_q, kwargs, block_q=None, valid_mask=None):
+             """
+             IGQ-aligned version:
+             - Compute integrated gradients of the (y_fp - y_wq) signal
+@@ -225,6 +225,8 @@
+                     # diff: [B, T, H]
+                     diff = y_fp - y_q
+                     F_tok = diff.abs().mean(dim=-1)  # [B, T]
++                    if valid_mask is not None:
++                        F_tok = torch.where(valid_mask.to(device), F_tok, torch.zeros_like(F_tok))
+ 
+                     grad_outputs = torch.ones_like(F_tok, device=F_tok.device, dtype=F_tok.dtype)
+                     grad = torch.autograd.grad(
+@@ -254,15 +256,29 @@
+ 
+             # === IQR clipping ===
+             eps = 1e-8
++            if valid_mask is not None:
++                token_imp = token_imp * valid_mask.to(device).float()
+             token_imp = token_imp / token_imp.sum(dim=1, keepdim=True).clamp_min(eps)
+ 
+-            q1 = torch.quantile(token_imp, 0.25, dim=1, keepdim=True)
+-            q3 = torch.quantile(token_imp, 0.75, dim=1, keepdim=True)
++            if valid_mask is None:
++                q1 = torch.quantile(token_imp, 0.25, dim=1, keepdim=True)
++                q3 = torch.quantile(token_imp, 0.75, dim=1, keepdim=True)
++            else:
++                valid_mask = valid_mask.to(device)
++                bounds = []
++                for row, mask in zip(token_imp, valid_mask):
++                    values = row[mask]
++                    bounds.append(torch.quantile(values, torch.tensor([0.25, 0.75], device=device))
++                                  if values.numel() else torch.zeros(2, device=device))
++                bounds = torch.stack(bounds)
++                q1, q3 = bounds[:, :1], bounds[:, 1:]
+             iqr = q3 - q1
+             lo = q1 - 1.5 * iqr
+             hi = q3 + 1.5 * iqr
+ 
+             clipped = torch.minimum(torch.maximum(token_imp, lo), hi)
++            if valid_mask is not None:
++                clipped = clipped * valid_mask.float()
+             token_w = clipped / clipped.sum(dim=1, keepdim=True).clamp_min(eps)
+ 
+             iqr_vis = {
+@@ -370,6 +386,7 @@
+ 
+         def _compute_token_importance_weights_batched(block, x, kwargs):
+             total = x.shape[0]
++            valid = _valid_mask(x, ans_mask, vis_mask).cpu()
+             chunks = []
+             block_q = copy.deepcopy(block).to(device)
+             if wa_quant:
+@@ -384,7 +401,8 @@
+                 end = min(start + batch_size, total)
+                 x_mb = x[start:end].to(device)
+                 kwargs_mb = move_to_device(slice_batch(kwargs or {}, start, end, total), device)
+-                token_mb, _ = _compute_token_importance_weights(block, x_mb, x_q=None, kwargs=kwargs_mb, block_q=block_q)
++                token_mb, _ = _compute_token_importance_weights(block, x_mb, x_q=None, kwargs=kwargs_mb,
++                                                              block_q=block_q, valid_mask=valid[start:end])
+                 chunks.append(token_mb.detach().cpu())
+                 del x_mb, kwargs_mb, token_mb
+                 empty_cache(device)
+@@ -406,6 +424,7 @@
+             x,
+             token_w=token_w if token_aware_saliency else None,
+             mix_lambda=saliency_mix_lambda if token_aware_saliency else 0.0,
++            valid_mask=_valid_mask(x, ans_mask, vis_mask),
+         )
+         best_error = float("inf")
+         best_ratio = -1
+@@ -465,13 +484,15 @@
+                     batch_size=batch_size,
+                     device=device,
+                 )
+-            elif token_weighted_loss:
++            elif not wa_quant:
++                # Every W/A16 ablation uses identical FP32 subtraction,
++                # finite-token handling and reduction. L only changes weights.
+                 loss_val = token_weighted_mse_in_batches(
+                     baseline_block,
+                     baseline_x=x,
+                     kwargs=kwargs,
+                     test_module=test_module,
+-                    token_w=token_w,
++                    token_w=token_w if token_weighted_loss else _uniform_weights(x, ans_mask, vis_mask),
+                     batch_size=batch_size,
+                     device=device,
+                 )
+@@ -482,9 +503,8 @@
+                     kwargs=kwargs,
+                     test_module=test_module,
+                     input_scales=scales if wa_quant else None,
+-                    # Match the repository AWQ objective: it passes vision_mask
+-                    # through its ans_mask argument.
+-                    ans_mask=vis_mask,
++                    # All W/A activation-quantized groups use this same routine.
++                    token_w=_uniform_weights(x, ans_mask, vis_mask),
+                     loss_mode="mse",
+                     batch_size=batch_size,
+                     device=device,
+--- a/qmllm/methods/lat_awq/quantize/pre_quant.py
++++ b/qmllm/methods/lat_awq/quantize/pre_quant.py
+@@ -30,6 +30,7 @@
+     forward_module_in_batches,
+     get_scale_search_batch_size,
+     move_to_device,
++    prepare_calibration_capture,
+ )
+ from .quantizer import get_module_by_name_suffix
+ 
+@@ -281,7 +282,7 @@
+     layers[0] = Catcher(layers[0])
+ 
+     inputs, vision_mask, caption_mask = process_input(prompt_inputs, prompt_kwargs)
+-    inputs = move_to_device(inputs, device)
++    inputs, capture_device = prepare_calibration_capture(model, inputs, device)
+ 
+     # model.to_cuda()
+     try:
+--- a/qmllm/methods/lat_awq/quantize/saliency.py
++++ b/qmllm/methods/lat_awq/quantize/saliency.py
+@@ -21,6 +21,7 @@
+     x: torch.Tensor,
+     token_w: torch.Tensor | None = None,
+     mix_lambda: float = 0.0,
++    valid_mask: torch.Tensor | None = None,
+ ):
+     """Return global, importance-weighted and mixed FP32 channel saliency."""
+     _validate_3d_input(x)
+@@ -30,7 +31,14 @@
+     x_abs = torch.nan_to_num(
+         x.detach().float(), nan=0.0, posinf=0.0, neginf=0.0
+     ).abs()
+-    a_global = x_abs.reshape(-1, x.shape[-1]).mean(0)
++    if valid_mask is None:
++        a_global = x_abs.reshape(-1, x.shape[-1]).mean(0)
++    else:
++        if tuple(valid_mask.shape) != tuple(x.shape[:2]):
++            raise ValueError('valid_mask must match [B,T]')
++        uniform = valid_mask.to(device=x_abs.device, dtype=torch.float32)
++        uniform = uniform / uniform.sum(dim=1, keepdim=True).clamp_min(EPS)
++        a_global = (x_abs * uniform.unsqueeze(-1)).sum(dim=(0, 1)) / uniform.shape[0]
+     if token_w is None:
+         a_imp = a_global.clone()
+     else:
+--- a/qmllm/methods/mbq/quantize/pre_quant.py
++++ b/qmllm/methods/mbq/quantize/pre_quant.py
+@@ -20,6 +20,7 @@
+     get_scale_search_batch_size,
+     module_device,
+     move_to_device,
++    prepare_calibration_capture,
+ )
+ from qmllm.utils.hf_compat import get_qwen_vl_layers, move_qwen_vl_embeddings
+ 
+@@ -347,9 +348,10 @@
+     layers[0] = Catcher(layers[0])
+ 
+     inputs, vision_mask, caption_mask = process_input(prompt_inputs, prompt_kwargs)
+-    inputs = move_to_device(inputs, device)
+-
+-    model.to_cuda()
++    inputs, capture_device = prepare_calibration_capture(model, inputs, device)
++
++    if capture_device.type != "cpu" or device.type == "cpu":
++        model.to_cuda()
+     try:
+         model(**inputs)
+     except ValueError: # work with early exit
+--- a/qmllm/methods/qig/quantize/pre_quant.py
++++ b/qmllm/methods/qig/quantize/pre_quant.py
+@@ -30,6 +30,7 @@
+     forward_module_in_batches,
+     get_scale_search_batch_size,
+     move_to_device,
++    prepare_calibration_capture,
+ )
+ from .quantizer import get_module_by_name_suffix
+ 
+@@ -276,7 +277,7 @@
+     layers[0] = Catcher(layers[0])
+ 
+     inputs, vision_mask, caption_mask = process_input(prompt_inputs, prompt_kwargs)
+-    inputs = move_to_device(inputs, device)
++    inputs, capture_device = prepare_calibration_capture(model, inputs, device)
+ 
+     # model.to_cuda()
+     try:
+--- a/qmllm/models/__init__.py
++++ b/qmllm/models/__init__.py
+@@ -4,14 +4,6 @@
+ 
+ import hf_transfer
+ from loguru import logger
+-
+-from qmllm.models.internvl2 import InternVL2
+-from qmllm.models.llava_onevision import LLaVA_onevision
+-from qmllm.models.llava_v15 import LLaVA_v15
+-from qmllm.models.qwen2_vl import Qwen2_VL
+-from qmllm.models.vila import vila
+-from qmllm.models.qwen2_5_vl import Qwen2_5_VL
+-from qmllm.models.qwen3_vl import Qwen3_VL
+ 
+ from qmllm.utils.registry import MODEL_REGISTRY
+ 
+@@ -21,4 +13,8 @@
+ logger.add(sys.stdout, level="WARNING")
+ 
+ def get_process_model(model_name):
++    # Import only the requested adapter. Optional model packages need not be
++    # installed to quantize an unrelated architecture.
++    module_name = {"llava": "llava_v15"}.get(model_name, model_name)
++    importlib.import_module(f"qmllm.models.{module_name}")
+     return MODEL_REGISTRY[model_name]
+--- a/qmllm/quantization/qlinear.py
++++ b/qmllm/quantization/qlinear.py
+@@ -19,7 +19,10 @@
+         else:
+             self.register_buffer('bias', None)
+ 
+-        if act_quant == 'per_token':
++        if a_bit >= 16:
++            self.act_quant_name = 'none'
++            self.act_quant = nn.Identity()
++        elif act_quant == 'per_token':
+             self.act_quant_name = 'per_token'
+             self.act_quant = partial(
+                 quantize_activation_per_token_absmax, n_bits=self.a_bit)
+--- a/qmllm/utils/device.py
++++ b/qmllm/utils/device.py
+@@ -80,6 +80,22 @@
+     if total is not None:
+         batch_size = min(batch_size, max(1, int(total)))
+     return batch_size
++
++
++def prepare_calibration_capture(model, inputs, device):
++    """Prepare masks/rotary inputs on CPU for large NPU calibration batches.
++
++    The first decoder layer is replaced by a catcher, so this forward only
++    prepares layer inputs. Keeping all rows on NPU would materialize the full
++    B x T x T mask before the subsequent mini-batched layer search.
++    """
++    device = torch.device(device)
++    tensor = next(value for value in inputs.values() if torch.is_tensor(value))
++    if device.type == "npu" and tensor.shape[0] > get_scale_search_batch_size():
++        device = torch.device("cpu")
++        model.to_cpu()
++        print(f"[calib-capture] preparing {tensor.shape[0]} rows on CPU; layer search stays on NPU", flush=True)
++    return move_to_device(inputs, device), device
+ 
+ 
+ def _channel_view(scales: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+@@ -288,7 +304,7 @@
+         mini_kwargs = move_to_device(slice_batch(kwargs, start, end, total), target)
+         mini_out = module(mini_inps, **mini_kwargs)
+         if collect_output:
+-            if output_index is not None:
++            if output_index is not None and isinstance(mini_out, (tuple, list)):
+                 mini_out = mini_out[output_index]
+             outputs.append(mini_out.detach().cpu())
+         del mini_inps, mini_kwargs, mini_out

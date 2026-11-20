@@ -117,7 +117,8 @@ def auto_scale_block_wa(module, module_kwargs, w_bit, a_bit, q_config, input_fea
         history = []
 
         baseline_block = copy.deepcopy(block).to(device).eval()
-        org_sd = {k: v.cpu() for k, v in block.state_dict().items()}
+        # Keep an independent snapshot even when the search runs on CPU.
+        org_sd = {k: v.to(device="cpu", copy=True) for k, v in block.state_dict().items()}
         for ratio in range(n_grid):
             ratio = ratio * 1 / n_grid
             scales = x_max.pow(ratio).clamp(min=1e-4).view(-1)
@@ -584,7 +585,7 @@ def auto_scale_block_wa(module, module_kwargs, w_bit, a_bit, q_config, input_fea
             )
         )
 
-    elif module.__class__.__name__ == "Qwen2VLDecoderLayer":
+    elif module.__class__.__name__ in ("Qwen2VLDecoderLayer", "Qwen2_5_VLDecoderLayer"):
         # attention input
         scales_list.append(
             _auto_get_scale_wa(

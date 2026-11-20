@@ -1,0 +1,3 @@
+# Frozen-source patches preserve upstream whitespace and context exactly.
+experiments/*/*.patch -whitespace
+experiments/llava_onevision7b_methods_20261111/benchmark_reference/* -whitespace

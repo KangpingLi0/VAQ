@@ -30,6 +30,7 @@ from qmllm.utils.device import (
     forward_module_in_batches,
     get_scale_search_batch_size,
     move_to_device,
+    prepare_calibration_capture,
 )
 from .quantizer import get_module_by_name_suffix
 
@@ -281,7 +282,7 @@ def run_lat_awq(
     layers[0] = Catcher(layers[0])
 
     inputs, vision_mask, caption_mask = process_input(prompt_inputs, prompt_kwargs)
-    inputs = move_to_device(inputs, device)
+    inputs, capture_device = prepare_calibration_capture(model, inputs, device)
 
     # model.to_cuda()
     try:

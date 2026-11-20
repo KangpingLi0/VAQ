@@ -513,3 +513,19 @@ sha256sum "${MODEL_PATH}"/*.safetensors "${CALIB_DATA}" "${SCALE_PATH}" \
 - [ ] 汇总结果前核对 task 的有效样本数，而不是只看进程退出码。
 
 本机特定的历史实验、目录和脚本说明仍见 [`docs/QIG_REPRODUCE.md`](docs/QIG_REPRODUCE.md)；在其他机器复现时应优先以本文为准。
+
+## 15. 2026 年 11 月实验代码
+
+`experiments/` 下已归档 Qwen2.5-VL-7B 四种子消融、LLaVA-OneVision-7B、InternVL2-8B 全方法比较及 Qwen 新增五项补测的启动脚本。各目录 README 记录实际运行协议；保留历史绝对路径，在其他机器运行前需调整本地模型、数据、Python 环境和输出位置。
+
+每个独立源码版本以 `project.patch`、`lmms_eval.patch` 和 `source_manifest.json` 保存。基于固定的 VAQ 和 lmms-eval 提交还原，逐文件检查 SHA256；不会覆盖已有运行源码：
+
+```bash
+git clone https://github.com/EvolvingLMMs-Lab/lmms-eval.git /path/to/lmms-eval
+python scripts/materialize_experiment_sources.py internvl2_8b_methods_20261115 \
+  --lmms-repo /path/to/lmms-eval
+# InternVL 的原运行环境使用独立的 timm 0.9.16：
+python -m pip install --target experiments/internvl2_8b_methods_20261115/deps timm==0.9.16 --no-deps
+```
+
+另外三个可还原目录为 `lat_awq_general_20261107`、`llava_onevision7b_methods_20261111` 和 `qwen25vl7b_extra5_20261116`。seed3407 队列复用原 Qwen 消融源码。数据、校准缓存和量化权重需按各准备脚本另行生成；恢复源码本身不会启动下载或评测。

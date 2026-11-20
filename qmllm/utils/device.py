@@ -82,6 +82,22 @@ def get_scale_search_batch_size(total: int | None = None, default: int = 8) -> i
     return batch_size
 
 
+def prepare_calibration_capture(model, inputs, device):
+    """Prepare masks/rotary inputs on CPU for large NPU calibration batches.
+
+    The first decoder layer is replaced by a catcher, so this forward only
+    prepares layer inputs. Keeping all rows on NPU would materialize the full
+    B x T x T mask before the subsequent mini-batched layer search.
+    """
+    device = torch.device(device)
+    tensor = next(value for value in inputs.values() if torch.is_tensor(value))
+    if device.type == "npu" and tensor.shape[0] > get_scale_search_batch_size():
+        device = torch.device("cpu")
+        model.to_cpu()
+        print(f"[calib-capture] preparing {tensor.shape[0]} rows on CPU; layer search stays on NPU", flush=True)
+    return move_to_device(inputs, device), device
+
+
 def _channel_view(scales: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     if target.dim() <= 1:
         return scales.view(-1)
@@ -288,7 +304,7 @@ def forward_module_in_batches(
         mini_kwargs = move_to_device(slice_batch(kwargs, start, end, total), target)
         mini_out = module(mini_inps, **mini_kwargs)
         if collect_output:
-            if output_index is not None:
+            if output_index is not None and isinstance(mini_out, (tuple, list)):
                 mini_out = mini_out[output_index]
             outputs.append(mini_out.detach().cpu())
         del mini_inps, mini_kwargs, mini_out

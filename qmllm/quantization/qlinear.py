@@ -19,7 +19,10 @@ class WALinear(nn.Module):
         else:
             self.register_buffer('bias', None)
 
-        if act_quant == 'per_token':
+        if a_bit >= 16:
+            self.act_quant_name = 'none'
+            self.act_quant = nn.Identity()
+        elif act_quant == 'per_token':
             self.act_quant_name = 'per_token'
             self.act_quant = partial(
                 quantize_activation_per_token_absmax, n_bits=self.a_bit)

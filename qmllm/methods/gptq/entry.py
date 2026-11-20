@@ -3,8 +3,6 @@ import torch
 from accelerate import Accelerator
 import torch, gc
 from qmllm.methods.gptq.quantize.pre_quant import run_gptq
-from lmms_eval.models import get_model
-from qmllm.models import get_process_model
 
 accelerator = Accelerator()
 

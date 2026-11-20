@@ -1,0 +1,15 @@
+{
+  "ablation_devices": [
+    0,
+    2,
+    3,
+    4
+  ],
+  "medical_devices": [
+    1,
+    5,
+    6,
+    7
+  ],
+  "source": "/data/lkp/VAQ/experiments/lat_awq_general_20261107/source"
+}

@@ -1,0 +1,10 @@
+torch==2.6.0
+torch-npu==2.6.0
+torchvision==0.21.0
+transformers==4.57.1
+accelerate==1.11.0
+datasets==4.4.1
+numpy==1.26.4
+ml-dtypes==0.5.4
+sympy==1.13.1
+protobuf==4.25.8

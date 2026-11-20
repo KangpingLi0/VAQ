@@ -20,6 +20,7 @@ from qmllm.utils.device import (
     get_scale_search_batch_size,
     module_device,
     move_to_device,
+    prepare_calibration_capture,
 )
 from qmllm.utils.hf_compat import get_qwen_vl_layers, move_qwen_vl_embeddings
 
@@ -347,9 +348,10 @@ def run_mbq(
     layers[0] = Catcher(layers[0])
 
     inputs, vision_mask, caption_mask = process_input(prompt_inputs, prompt_kwargs)
-    inputs = move_to_device(inputs, device)
+    inputs, capture_device = prepare_calibration_capture(model, inputs, device)
 
-    model.to_cuda()
+    if capture_device.type != "cpu" or device.type == "cpu":
+        model.to_cuda()
     try:
         model(**inputs)
     except ValueError: # work with early exit
